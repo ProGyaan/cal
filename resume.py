@@ -95,6 +95,116 @@ TOURNAMENT_POWER_USERS: Set[Tuple[int, int]] = set()  # (user_id, group_id) pair
 
   # Users with broadcast + groupapprove permissions
 
+# ═══════════════════════════════════════════════════════════════
+# IMAGE COOLDOWN SYSTEM  — 15 sec per group for user-triggered image commands
+# ═══════════════════════════════════════════════════════════════
+IMAGE_COOLDOWN_SECONDS = 15
+# {group_id: last_image_timestamp}
+image_cooldown_tracker: Dict[int, float] = defaultdict(float)
+
+# Players command 30-second cooldown (per group, only during active match)
+PLAYERS_COOLDOWN_SECONDS = 30
+players_cooldown_tracker: Dict[int, float] = defaultdict(float)
+
+# Full scorecard command 2-minute cooldown (per group)
+SCORECARD_COOLDOWN_SECONDS = 120
+scorecard_cooldown_tracker: Dict[int, float] = defaultdict(float)
+
+# Strikemap and Momentum 2-minute cooldown (per group)
+STRIKEMAP_COOLDOWN_SECONDS = 120
+MOMENTUM_COOLDOWN_SECONDS = 120
+strikemap_cooldown_tracker: Dict[int, float] = defaultdict(float)
+momentum_cooldown_tracker: Dict[int, float] = defaultdict(float)
+
+def check_scorecard_cooldown(group_id: int) -> Optional[float]:
+    """Returns remaining cooldown seconds if still in cooldown, else None."""
+    last = scorecard_cooldown_tracker.get(group_id, 0.0)
+    elapsed = time.time() - last
+    remaining = SCORECARD_COOLDOWN_SECONDS - elapsed
+    if remaining > 0:
+        return remaining
+    return None
+
+def set_scorecard_cooldown(group_id: int):
+    """Mark scorecard command just used in this group."""
+    scorecard_cooldown_tracker[group_id] = time.time()
+
+def check_strikemap_cooldown(group_id: int) -> Optional[float]:
+    last = strikemap_cooldown_tracker.get(group_id, 0.0)
+    elapsed = time.time() - last
+    remaining = STRIKEMAP_COOLDOWN_SECONDS - elapsed
+    return remaining if remaining > 0 else None
+
+def set_strikemap_cooldown(group_id: int):
+    strikemap_cooldown_tracker[group_id] = time.time()
+
+def check_momentum_cooldown(group_id: int) -> Optional[float]:
+    last = momentum_cooldown_tracker.get(group_id, 0.0)
+    elapsed = time.time() - last
+    remaining = MOMENTUM_COOLDOWN_SECONDS - elapsed
+    return remaining if remaining > 0 else None
+
+def set_momentum_cooldown(group_id: int):
+    momentum_cooldown_tracker[group_id] = time.time()
+
+def check_players_cooldown(group_id: int) -> Optional[float]:
+    """Returns remaining cooldown seconds if still in cooldown, else None."""
+    last = players_cooldown_tracker.get(group_id, 0.0)
+    elapsed = time.time() - last
+    remaining = PLAYERS_COOLDOWN_SECONDS - elapsed
+    if remaining > 0:
+        return remaining
+    return None
+
+def set_players_cooldown(group_id: int):
+    """Mark players command just used in this group."""
+    players_cooldown_tracker[group_id] = time.time()
+
+# Mid-match random image tracker: {group_id: over_count_at_last_image}
+mid_match_image_tracker: Dict[int, int] = defaultdict(int)
+
+# Commands that generate images and are user-triggered in groups
+IMAGE_COMMANDS = {"strikemap", "momentum", "scorecard", "mystats", "leaderboard", "lb", "players", "soloplayers"}
+
+def check_image_cooldown(group_id: int) -> Optional[float]:
+    """
+    Returns remaining cooldown seconds if still in cooldown, else None.
+    Should only be called for GROUP chats (not DMs).
+    """
+    last = image_cooldown_tracker.get(group_id, 0.0)
+    elapsed = time.time() - last
+    remaining = IMAGE_COOLDOWN_SECONDS - elapsed
+    if remaining > 0:
+        return remaining
+    return None
+
+def set_image_cooldown(group_id: int):
+    """Mark image just sent in this group."""
+    image_cooldown_tracker[group_id] = time.time()
+
+async def send_cooldown_warning(update: Update, remaining: float):
+    """Send a short ephemeral-style cooldown warning."""
+    secs = math.ceil(remaining)
+    bars_filled = int((IMAGE_COOLDOWN_SECONDS - remaining) / IMAGE_COOLDOWN_SECONDS * 10)
+    bar = "█" * bars_filled + "░" * (10 - bars_filled)
+    msg = (
+        f"⏳ <b>Image Cooldown Active</b>\n"
+        f"┌─────────────────────┐\n"
+        f"│  <code>[{bar}]</code>  │\n"
+        f"│  ⏱ Wait <b>{secs}s</b> more…      │\n"
+        f"└─────────────────────┘\n"
+        f"<i>Image commands cool down every {IMAGE_COOLDOWN_SECONDS}s to reduce server load.</i>"
+    )
+    try:
+        warn = await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        # Auto-delete warning after the remaining cooldown
+        asyncio.get_event_loop().call_later(
+            remaining + 1,
+            lambda: asyncio.ensure_future(warn.delete())
+        )
+    except Exception:
+        pass
+
 # Game Constants
 class GamePhase(Enum):
     IDLE = "idle"
@@ -868,7 +978,7 @@ def init_db():
     # Create gc_settings table for per-group admin settings
     c.execute('''CREATE TABLE IF NOT EXISTS gc_settings (
         group_id INTEGER PRIMARY KEY,
-        drs_enabled INTEGER DEFAULT 1,
+        drs_enabled INTEGER DEFAULT 0,
         commentary_style TEXT DEFAULT 'english',
         wide_enabled INTEGER DEFAULT 1,
         lobby_time INTEGER DEFAULT 120
@@ -879,7 +989,7 @@ def init_db():
     except Exception:
         c.execute('''CREATE TABLE IF NOT EXISTS gc_settings (
             group_id INTEGER PRIMARY KEY,
-            drs_enabled INTEGER DEFAULT 1,
+            drs_enabled INTEGER DEFAULT 0,
             commentary_style TEXT DEFAULT 'english',
             wide_enabled INTEGER DEFAULT 1,
             lobby_time INTEGER DEFAULT 120
@@ -1163,7 +1273,7 @@ def save_gc_setting(group_id: int):
             (group_id, drs_enabled, commentary_style, wide_enabled, lobby_time)
             VALUES (?, ?, ?, ?, ?)""",
             (group_id,
-             int(s.get("drs_enabled", True)),
+             int(s.get("drs_enabled", False)),
              s.get("commentary_style", "english"),
              int(s.get("wide_enabled", True)),
              s.get("lobby_time", 120)))
@@ -1176,13 +1286,13 @@ def get_gc_setting(group_id: int, key: str, default=None):
     """Get a specific setting for a group"""
     if group_id not in gc_settings:
         gc_settings[group_id] = {
-            "drs_enabled": True,
+            "drs_enabled": False,
             "commentary_style": "english",
             "wide_enabled": True,
             "lobby_time": 120
         }
     return gc_settings[group_id].get(key, default if default is not None else {
-        "drs_enabled": True, "commentary_style": "english",
+        "drs_enabled": False, "commentary_style": "english",
         "wide_enabled": True, "lobby_time": 120
     }.get(key))
 
@@ -1217,8 +1327,13 @@ def init_player_stats(user_id: int):
         "balls": 0,
         "wickets": 0,
         "highest": 0,
+        "high_score": 0,
         "ducks": 0,
-        "top_3_finishes": 0
+        "top_3_finishes": 0,
+        "sixes": 0,
+        "fours": 0,
+        "centuries": 0,
+        "fifties": 0
     }
 
 
@@ -1421,18 +1536,11 @@ class Team:
         return self.balls % 6
     
     def complete_over(self):
-        """Complete the current over"""
+        """Complete the current over - NOTE: over tracking is handled in check_over_complete, not here"""
         remaining_balls = 6 - (self.balls % 6)
-        self.balls += remaining_balls
-        self.overs = self.balls // 6
-        if match.batting_first_team_id == match.team_x.captain_id:
-            # Team X batting
-            match.team_x_over_runs.append(match.current_over_runs)
-        else:
-            # Team Y batting
-            match.team_y_over_runs.append(match.current_over_runs)
-    
-        match.current_over_runs = 0  # Reset for new over
+        if remaining_balls < 6:
+            self.balls += remaining_balls
+        self.update_overs()
 
 # Match class - Core game engine
 class Match:
@@ -1507,10 +1615,6 @@ class Match:
         # Super over
         self.is_super_over = False
         self.super_over_batting_team: Optional[Team] = None
-        
-        # Match settings
-        self.host_id: Optional[int] = None
-        self.host_name: str = "Unknown"
         
         # Match log
         self.ball_by_ball_log: List[Dict] = []
@@ -1620,19 +1724,17 @@ def update_over_stats(match):
     """Calculates runs scored in the just-concluded over and saves them."""
     
     # 1. Determine which team is currently batting
-    if not match.is_second_innings:
-        # Team X is batting
-        current_score = match.team_x.score
-        # Sum of previous overs
+    bat_team = match.current_batting_team
+    if bat_team is None:
+        return
+    if bat_team == match.team_x:
         already_accounted = sum(match.team_x_over_runs)
-        runs_in_this_over = current_score - already_accounted
-        match.team_x_over_runs.append(runs_in_this_over)
+        runs_in_this_over = bat_team.score - already_accounted
+        match.team_x_over_runs.append(max(0, runs_in_this_over))
     else:
-        # Team Y is batting
-        current_score = match.team_y.score
         already_accounted = sum(match.team_y_over_runs)
-        runs_in_this_over = current_score - already_accounted
-        match.team_y_over_runs.append(runs_in_this_over)
+        runs_in_this_over = bat_team.score - already_accounted
+        match.team_y_over_runs.append(max(0, runs_in_this_over))
 
 def get_random_gif(event: MatchEvent) -> str:
     """Get random GIF for an event"""
@@ -1658,7 +1760,7 @@ def generate_mini_scorecard(match: Match) -> str:
     bowl_team = match.current_bowling_team
     
     # Calculate Run Rate
-    overs_played = max(bat_team.overs, 0.1)
+    overs_played = max(bat_team.balls / 6, 0.1)
     current_rr = round(bat_team.score / overs_played, 2)
     
     # Get Current Batsmen
@@ -2133,26 +2235,50 @@ async def cheer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Yeh logic wahan dalo jahan over khatam hota hai (e.g., balls % 6 == 0)
 def end_over_logic(match):
-    # Team 1 batting kar rahi hai
-    if not match.is_second_innings:
-        current_total = match.team_x.score
+    # Use current_batting_team to determine who is batting
+    bat_team = match.current_batting_team
+    if bat_team is None:
+        return
+    if bat_team == match.team_x:
         previous_total = sum(match.team_x_over_runs)
-        runs_in_this_over = current_total - previous_total
-        match.team_x_over_runs.append(runs_in_this_over)
+        runs_in_this_over = bat_team.score - previous_total
+        match.team_x_over_runs.append(max(0, runs_in_this_over))
     else:
-        # Team 2 batting kar rahi hai
-        current_total = match.team_y.score
         previous_total = sum(match.team_y_over_runs)
-        runs_in_this_over = current_total - previous_total
-        match.team_y_over_runs.append(runs_in_this_over)
+        runs_in_this_over = bat_team.score - previous_total
+        match.team_y_over_runs.append(max(0, runs_in_this_over))
 
 # ============================================================
 # REPLACEMENT 3: Replace scorecard_command function
 # ============================================================
 
 async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """🏏 Compact scorecard — Batsman: R(B) SR 4s 6s | Bowler: W/R Ov Eco"""
+    """🏏 Enhanced scorecard — Professional formatting with full innings breakdown"""
     group_id = update.effective_chat.id
+    # ── Image cooldown check ──
+    if update.effective_chat.type != "private":
+        remaining = check_image_cooldown(group_id)
+        if remaining is not None:
+            await send_cooldown_warning(update, remaining)
+            return
+        # ── Full scorecard 2-minute cooldown ──
+        sc_remaining = check_scorecard_cooldown(group_id)
+        if sc_remaining is not None:
+            secs = math.ceil(sc_remaining)
+            mins = secs // 60
+            sec_part = secs % 60
+            warn_msg = await update.message.reply_text(
+                f"⏳ <b>Scorecard Cooldown</b>\n"
+                f"Wait <b>{mins}m {sec_part}s</b> before using /scorecard again.\n"
+                f"<i>Cooldown prevents spam (2 min per group).</i>",
+                parse_mode=ParseMode.HTML
+            )
+            asyncio.get_event_loop().call_later(
+                sc_remaining + 1,
+                lambda: asyncio.ensure_future(warn_msg.delete())
+            )
+            return
+        set_scorecard_cooldown(group_id)
     match = active_matches.get(group_id)
     
     if not match:
@@ -2172,36 +2298,43 @@ async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fours = player.boundaries
         sixes = player.sixes
         sr = round(runs / balls * 100, 1) if balls > 0 else 0.0
-        cap = "(C)" if player.user_id == team.captain_id else ""
+        cap = " 👑" if player.user_id == team.captain_id else ""
         status = "❌" if player.is_out else "🟢"
-        name = html.escape(player.first_name[:12])
+        name = html.escape(player.first_name[:14])
         bdry = ""
-        if fours > 0: bdry += f" 4s:{fours}"
-        if sixes > 0: bdry += f" 6s:{sixes}"
-        return f"{status} <b>{name}{cap}</b>  {runs}({balls}) SR:{sr}{bdry}\n"
+        if fours > 0: bdry += f"  4s:<b>{fours}</b>"
+        if sixes > 0: bdry += f"  6s:<b>{sixes}</b>"
+        return f"  {status} <b>{name}{cap}</b>\n    ├ {runs}({balls})  SR: {sr}{bdry}\n"
     
     def _bowl_line(player):
         bb = player.balls_bowled
         if bb == 0: return ""
         ov = f"{bb//6}.{bb%6}"
         eco = round(player.runs_conceded / (bb/6), 2) if bb > 0 else 0
-        name = html.escape(player.first_name[:12])
-        return f"⚡ <b>{name}</b>  {player.wickets}/{player.runs_conceded}  {ov}ov  Eco:{eco}\n"
+        name = html.escape(player.first_name[:14])
+        return f"  ⚡ <b>{name}</b>  <code>{player.wickets}/{player.runs_conceded}</code>  {ov}ov  Eco: {eco}\n"
     
-    def _innings_block(bat_team, bowl_team, label):
+    def _innings_block(bat_team, bowl_team, label, inn_num):
         rr = round(bat_team.score / (bat_team.balls / 6), 2) if bat_team.balls > 0 else 0
+        extras = bat_team.extras if hasattr(bat_team, 'extras') else 0
         block = (
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏏 <b>{bat_team.name}</b> {bat_team.score}/{bat_team.wickets}"
-            f" ({format_overs(bat_team.balls)} ov)  RR:{rr}  +{bat_team.extras}e\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"╔═════════════════════╗\n"
+            f"║  🏏 {inn_num} INNINGS — {bat_team.name}\n"
+            f"╚═════════════════════╝\n"
+            f"📊 <b>{bat_team.score}/{bat_team.wickets}</b>  ({format_overs(bat_team.balls)} ov)  "
+            f"RR: <b>{rr}</b>  Extras: {extras}\n"
+            f"───────────────────────\n"
+            f"🏏 <b>BATTING</b>\n"
         )
         batters = [p for p in bat_team.players if p.balls_faced > 0 or p.is_out]
         for p in batters:
             block += _bat_line(p, bat_team)
         if not batters:
             block += "  <i>Not started yet</i>\n"
-        block += "⚾ <b>BOWLING</b>\n"
+        block += (
+            f"────────────────────\n"
+            f"⚾ <b>BOWLING</b>\n"
+        )
         bowlers = [p for p in bowl_team.players if p.balls_bowled > 0]
         for p in bowlers:
             block += _bowl_line(p)
@@ -2209,8 +2342,13 @@ async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             block += "  <i>No bowlers yet</i>\n"
         return block
     
-    text = "📊 <b>SCORECARD</b>\n"
-    text += _innings_block(first_team, second_team, "1st")
+    now = datetime.now().strftime("%d %b %Y  %H:%M")
+    text = (
+        f"📋 <b>LIVE SCORECARD</b>  ●  {match.total_overs} Overs\n"
+        f"🏟️ <i>CricoVerse Hand Cricket</i>  ·  {now}\n"
+        f"═════════════════════\n\n"
+    )
+    text += _innings_block(first_team, second_team, "1ST", "1st")
     
     if match.innings >= 2:
         text += "\n"
@@ -2218,18 +2356,47 @@ async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             needed = match.target - second_team.score
             balls_left = (match.total_overs * 6) - second_team.balls
             rrr = round(needed / (balls_left / 6), 2) if balls_left > 0 else 0
-            text += f"🎯 Target:{match.target}  Need:{needed} in {balls_left}b  RRR:{rrr}\n"
-        text += _innings_block(second_team, first_team, "2nd")
+            text += (
+                f"🎯 <b>TARGET: {match.target}</b>  ·  "
+                f"Need <b>{needed}</b> off <b>{balls_left}b</b>  ·  RRR: <b>{rrr}</b>\n\n"
+            )
+        text += _innings_block(second_team, first_team, "2ND", "2nd")
     
-    _refresh_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data=f"scorecard_refresh_{group_id}")]])
-    try:
+    text += f"\n<i>🔄 Tap Refresh for latest scores</i>"
+
+    _refresh_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Scorecard", callback_data=f"scorecard_refresh_{group_id}")]])
+
+    # ── Try to send Worm Graph as the scorecard photo with full scorecard as caption ──
+    worm_sent = False
+    if match and (len(match.team_x_over_runs) > 0 or getattr(match, 'current_over_runs', 0) > 0):
         try:
-            await update.message.reply_photo(photo=SCORECARD_PHOTO, caption=text, parse_mode=ParseMode.HTML, reply_markup=_refresh_kb)
-        except:
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=_refresh_kb)
-    except Exception as e:
-        clean = text.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","")
-        await update.message.reply_text(clean, reply_markup=_refresh_kb)
+            worm_bio = generate_worm_graph(match)
+            if worm_bio:
+                caption = text if len(text) <= 1024 else text[:1020] + "…"
+                await update.message.reply_photo(
+                    photo=worm_bio,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_refresh_kb
+                )
+                if update.effective_chat.type != "private":
+                    set_image_cooldown(group_id)
+                worm_sent = True
+        except Exception as worm_sc_err:
+            logger.error(f"Worm graph in scorecard cmd error: {worm_sc_err}")
+
+    # ── Fallback: send scorecard image or text if worm was not sent ──
+    if not worm_sent:
+        try:
+            try:
+                await update.message.reply_photo(photo=SCORECARD_PHOTO, caption=text[:1024] if len(text) > 1024 else text, parse_mode=ParseMode.HTML, reply_markup=_refresh_kb)
+                if update.effective_chat.type != "private":
+                    set_image_cooldown(group_id)
+            except:
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=_refresh_kb)
+        except Exception as e:
+            clean = text.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","").replace("<code>","").replace("</code>","")
+            await update.message.reply_text(clean, reply_markup=_refresh_kb)
 
 async def cleanup_inactive_matches(context: ContextTypes.DEFAULT_TYPE):
     """Auto-end matches inactive for > 15 minutes"""
@@ -2317,8 +2484,7 @@ async def handle_timeout_penalties(context: ContextTypes.DEFAULT_TYPE, group_id:
             msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
             msg += "🚫 <b>Result:</b> NO BALL! (+1 Run)\n"
             msg += "⚡ <b>Next ball is a FREE HIT!</b>\n"
-            msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
-            msg += "⌛ Bowling timer resetting..."
+
             await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
             
             # Reset inputs to allow re-bowl (No ball doesn't count legal ball)
@@ -2350,13 +2516,14 @@ async def handle_timeout_penalties(context: ContextTypes.DEFAULT_TYPE, group_id:
         else:
             bat_team.score -= 6
             bat_team.score = max(0, bat_team.score) # Score negative nahi jayega
+            # Update current_over_runs for graph accuracy
+            match.current_over_runs = max(0, getattr(match, 'current_over_runs', 0) - 6)
             
             msg = f"⏰ <b>BATSMAN TIMEOUT!</b> ({striker.batting_timeouts}/3)\n"
             msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
             msg += "📉 <b>Penalty:</b> -6 Runs!\n"
             msg += f"📊 <b>Score:</b> {bat_team.score}/{bat_team.wickets}\n"
-            msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
-            msg += "🔄 <b>Ball Counted.</b> (Dot Ball)"
+
             await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
             
             # Count ball but no runs (Treat as Dot Ball)
@@ -3455,12 +3622,13 @@ async def extend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Extend time
-    match.last_activity = datetime.now() + timedelta(seconds=seconds)
+    match.last_activity = time.time() + seconds
+    new_deadline = datetime.fromtimestamp(match.last_activity)
     
     await update.message.reply_text(
         f"⏰ <b>Match Extended!</b>\n\n"
         f"⏱️ Added <b>{seconds} seconds</b> to the match.\n"
-        f"🕐 New deadline: <b>{match.last_activity.strftime('%I:%M:%S %p')}</b>",
+        f"🕐 New deadline: <b>{new_deadline.strftime('%I:%M:%S %p')}</b>",
         parse_mode=ParseMode.HTML
     )
     
@@ -3502,16 +3670,16 @@ async def host_selection_callback(update: Update, context: ContextTypes.DEFAULT_
     
     match.phase = GamePhase.OVER_SELECTION
     
-    # --- LOGIC FOR 4 TO 20 OVERS ---
+    # --- LOGIC FOR 1 TO 20 OVERS ---
     keyboard = []
     row = []
-    # Loop from 4 to 20 (inclusive)
-    for i in range(4, 21):
+    # Loop from 1 to 20 (inclusive)
+    for i in range(1, 21):
         # Add button to current row
         row.append(InlineKeyboardButton(f"{i}", callback_data=f"overs_{i}"))
         
-        # If row has 4 buttons, add it to keyboard and start new row
-        if len(row) == 4:
+        # If row has 5 buttons, add it to keyboard and start new row
+        if len(row) == 5:
             keyboard.append(row)
             row = []
             
@@ -3527,7 +3695,7 @@ async def host_selection_callback(update: Update, context: ContextTypes.DEFAULT_
     msg = f"🎙 <b>HOST: {user_tag}</b>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += "Host, please select the number of overs for this match.\n"
-    msg += "Range: <b>4 to 20 Overs</b>"
+    msg += "Range: <b>1 to 20 Overs</b>"
     
     # Use Safe Refresh Function
     await refresh_game_message(context, chat.id, match, msg, reply_markup, media_key="host")
@@ -3774,7 +3942,7 @@ async def add_player_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     # Build response message
     msg = f"📊 <b>BULK ADD RESULT - {t_name}</b>\n"
-    msg += "────────────────────\n\n"
+    msg += "────────────────────\n"
     
     if added_users:
         msg += f"✅ <b>Added ({len(added_users)}):</b>\n"
@@ -3913,7 +4081,7 @@ async def remove_player_command(update: Update, context: ContextTypes.DEFAULT_TY
     
     # Build response message
     msg = f"📊 <b>BULK REMOVE RESULT - {team_name}</b>\n"
-    msg += "────────────────────\n\n"
+    msg += "────────────────────\n"
     
     if removed_users:
         msg += f"✅ <b>Removed ({len(removed_users)}):</b>\n"
@@ -4016,7 +4184,7 @@ async def over_selection_callback(update: Update, context: ContextTypes.DEFAULT_
         if len(data_parts) != 2: return
         overs_selected = int(data_parts[1])
         
-        if 4 <= overs_selected <= 20:
+        if 1 <= overs_selected <= 20:
             match.total_overs = overs_selected
             
             # ✅ FLOW FIX: Overs ke baad ab Team Edit Mode aayega
@@ -4024,7 +4192,7 @@ async def over_selection_callback(update: Update, context: ContextTypes.DEFAULT_
             await start_team_edit_phase(query, context, match)
             
         else:
-            await query.answer("Overs must be between 4 and 20.", show_alert=True)
+            await query.answer("Overs must be between 1 and 20.", show_alert=True)
     except ValueError:
         await query.answer("Invalid format.", show_alert=True)
 
@@ -4042,7 +4210,7 @@ async def start_toss(query, context: ContextTypes.DEFAULT_TYPE, match: Match):
     
     toss_text = f"🪙 <b>TOSS TIME!</b>\n"
     toss_text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    toss_text += f"🏏 <b>Format:</b> {match.total_overs} Overs  |  🏟️ Hand Cricket\n"
+    toss_text += f"🏏 <b>Format:</b> {match.total_overs} Overs\n"
     toss_text += f"⏱ <b>Timer:</b> 30 seconds to decide\n"
     toss_text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
     toss_text += f"👑 <b>{cap_x_name}</b> — it's your call!\n"
@@ -4101,7 +4269,6 @@ async def toss_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     decision_text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
     decision_text += f"👑 <b>Captain {winner_captain.first_name}</b> — Bat or Bowl?\n"
     decision_text += f"⏱ <b>Timer:</b> 30 seconds to decide\n"
-    decision_text += "<i>Choose wisely!</i>"
     
     # ✅ FIX: Use refresh_game_message instead of edit_message_text
     await refresh_game_message(context, chat.id, match, decision_text, reply_markup, media_key="toss")
@@ -4185,8 +4352,6 @@ async def start_match(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
     toss_summary += f"🪙 <b>{match.toss_winner.name}</b> won the toss\n"
     toss_summary += f"🏏 <b>{match.batting_first.name}</b> {decision_method} bat first\n"
     toss_summary += f"📏 Format: <b>{match.total_overs} Overs</b> per side\n"
-    toss_summary += "━━━━━━━━━━━━━━━━━━━━━\n"
-    toss_summary += "⚡ <i>Openers walking to the crease...</i>"
     
     await context.bot.send_message(chat_id=group_id, text=toss_summary, parse_mode=ParseMode.HTML)
     
@@ -4204,9 +4369,7 @@ async def start_match(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
     
     captain_tag = get_user_tag(captain)
     
-    msg = f"🏏 <b>SELECT YOUR OPENER</b>\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"👑 {captain_tag} — who's opening the batting?\n"
+    msg = f"👑 {captain_tag} — who's opening the batting?\n"
     msg += f"⌨️ <code>/batting [number]</code>  <i>e.g. /batting 1</i>\n"
     msg += f"👥 <b>{len(match.current_batting_team.players)} players available</b>"
     
@@ -4230,8 +4393,6 @@ async def request_batsman_selection(context: ContextTypes.DEFAULT_TYPE, chat_id:
     msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"👑 {captain_tag} — send in your next batter!\n"
     msg += f"⌨️ <code>/batting [number]</code>\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"⏱ <b>Batting Time:</b> 30 seconds"
     
     await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
     
@@ -4556,13 +4717,13 @@ async def players_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if match.phase == GamePhase.MATCH_IN_PROGRESS or match.innings >= 1:
             rr = round(team.score / max(team.balls / 6, 0.1), 2) if team.balls > 0 else 0.0
             block += f"   📊 {team.score}/{team.wickets} ({format_overs(team.balls)} ov)  RR:{rr}\n"
-        block += "─────────────────────────\n"
+        block += "─────────────────────\n"
         for i, player in enumerate(team.players, 1):
             block += _build_player_row(player, team, i)
         return block
     
     text = "🏏 <b>PLAYING SQUADS</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += "━━━━━━━━━━━━━━━━\n"
     
     # Show phase info
     if match.phase == GamePhase.TEAM_JOINING:
@@ -4576,7 +4737,7 @@ async def players_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif match.phase == GamePhase.MATCH_ENDED:
         text += "🏆 <i>Match completed</i>\n"
     
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += "━━━━━━━━━━━━━━━━\n"
     
     x_players = len(match.team_x.players)
     y_players = len(match.team_y.players)
@@ -4585,18 +4746,42 @@ async def players_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "\n"
     text += _build_team_block(match.team_y, "🔴", y_players)
     
-    text += "\n━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "👑 Cap  🪙 Toss Won  🏏 Batting  🔄 Non-Striker  ⚡ Bowling  ❌ Out  🟢 Active"
     
+    # 30-second cooldown for players command during active match
+    if match.phase == GamePhase.MATCH_IN_PROGRESS:
+        remaining = check_players_cooldown(group_id)
+        if remaining is not None:
+            secs = math.ceil(remaining)
+            cool_msg = await update.message.reply_text(
+                f"⏳ <b>Players command cooldown:</b> Wait <b>{secs}s</b> more!",
+                parse_mode=ParseMode.HTML
+            )
+            asyncio.get_event_loop().call_later(
+                remaining + 1,
+                lambda: asyncio.ensure_future(cool_msg.delete())
+            )
+            return
+        set_players_cooldown(group_id)
+
     try:
-        await update.message.reply_photo(
+        sent = await update.message.reply_photo(
             photo=PLAYERS_PHOTO, caption=text, parse_mode=ParseMode.HTML
         )
     except Exception:
         try:
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+            sent = await update.message.reply_text(text, parse_mode=ParseMode.HTML)
         except Exception:
             await update.message.reply_text("🏏 Players list unavailable right now.")
+            return
+    # Pin the players message
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=group_id,
+            message_id=sent.message_id,
+            disable_notification=True
+        )
+    except Exception:
+        pass
 
 
 
@@ -4704,9 +4889,6 @@ async def request_bowler_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"👑 {captain_tag} — pick your bowler!\n"
     msg += f"⌨️ <code>/bowling [number]</code>\n"
-    msg += f"🎳 <b>{len(available)} bowler(s)</b> available\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"⏱ <b>Bowling Time:</b> 30 seconds"
     
     # Send message to group
     try:
@@ -4810,9 +4992,8 @@ async def bowler_selection_timeout(context: ContextTypes.DEFAULT_TYPE, group_id:
         else:
             # First ball, no specific bowler to penalize
             penalty_msg = (
-                f"⏱️ <b>BOWLER SELECTION TIMEOUT!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"⚠️ <b>{match.current_bowling_team.name}</b> delayed bowler selection!\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"💸 -6 Run Penalty applied.\n"
                 f"⌨️ <code>/bowling [number]</code> — select NOW!"
             )
@@ -4996,10 +5177,10 @@ async def execute_ball(context: ContextTypes.DEFAULT_TYPE, group_id: int, match:
     overs_str = format_overs(bowl_team.balls)
     crr_str = f"{crr:.2f}"
     
-    text = f"🔴 <b>LIVE</b>  ●  OVER <b>{overs_str}</b>  ●  <b>HAND CRICKET</b>\n"
+    text = f"🔴 <b>LIVE</b>   ┊  ⏱ {format_overs(bowl_team.balls)} ov  ┊  RR {crr_str} \n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"🏏 {striker_tag}  ⚡ <b>vs</b> ⚡  ⚾ {bowler_tag}\n"
-    text += f"📊 <b>{bat_team.score}/{bat_team.wickets}</b>  ┊  ⏱ {format_overs(bowl_team.balls)} ov  ┊  RR {crr_str}\n"
+    text += f"🏏 {striker_tag}\n"
+    text += f"⚾ {bowler.first_name}\n"
     
     if equation:
         text += f"{equation}\n"
@@ -5007,8 +5188,8 @@ async def execute_ball(context: ContextTypes.DEFAULT_TYPE, group_id: int, match:
     if match.is_free_hit:
         text += "🚨 ⚡ <b>FREE HIT!</b> — Batsman CANNOT be dismissed! ⚡ 🚨\n"
         
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"⚾ <b>{bowler.first_name}</b> runs in to bowl... 🏃‍♂️💨"
+    text += "━━━━━━━━━━━━━━━━━━━\n"
+    text += f"⚾ <b>{bowler_tag}</b> runs in to bowl... 🏃‍♂️💨"
 
     # Button
     keyboard = [[InlineKeyboardButton("📩 Tap to Bowl", url=f"https://t.me/{context.bot.username}")]]
@@ -5685,6 +5866,8 @@ async def handle_batsman_timeout(context: ContextTypes.DEFAULT_TYPE, group_id: i
     match.current_batting_team.score -= 6
     match.current_batting_team.score = max(0, match.current_batting_team.score)
     match.current_batting_team.penalty_runs += 6
+    # Update current_over_runs to reflect penalty (so worm/bar chart shows correct values)
+    match.current_over_runs = max(0, getattr(match, 'current_over_runs', 0) - 6)
     
     if timeout_count >= 3:
         # Auto out - Hit Wicket
@@ -5700,7 +5883,7 @@ async def handle_batsman_timeout(context: ContextTypes.DEFAULT_TYPE, group_id: i
         
         penalty_text = f"🚨 <b>BATSMAN TIMEOUT — OUT!</b>\n"
         penalty_text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        penalty_text += f"⛔ <b>{batsman.first_name}</b> timed out 3 times — Hit Wicket!\n"
+        penalty_text += f"⛔ <b>{batsman.first_name}</b> timed out 3 times — Wicket!\n"
         penalty_text += f"🏃 Score: {batsman.runs}({batsman.balls_faced})  ·  💸 -6 Run Penalty\n"
         penalty_text += f"📊 Score: <b>{match.current_batting_team.score}/{match.current_batting_team.wickets}</b>"
         
@@ -5810,6 +5993,18 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
             except:
                 await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
             
+            # ✅ LOG WIDE BALL
+            match.ball_by_ball_log.append({
+                "over": format_overs(bowl_team.balls),
+                "batsman": striker.first_name,
+                "bowler": bowler.first_name,
+                "batting_team": bat_team.name,
+                "runs": 1,
+                "wicket": False,
+                "is_wicket": False,
+                "wide": True,
+                "noball": False,
+            })
             match.current_ball_data = {}
             await asyncio.sleep(2)
             
@@ -5843,6 +6038,8 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
             bowler.balls_bowled += 1
             bowler.runs_conceded += half_runs
             bowl_team.balls += 1
+            bat_team.balls += 1  # ✅ Sync batting team ball count
+            bat_team.update_overs()
             bowl_team.update_overs()
             
             commentary = get_commentary("freehit", group_id=group_id)
@@ -5887,14 +6084,12 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
             striker_tag = get_user_tag(striker)
             commentary = get_commentary("wicket", group_id=group_id)
             
-            wicket_msg = f"💥 <b>WICKET!</b> 💥\n"
+            wicket_msg = f"⚾ <b>{bowler.first_name}</b> takes the wicket!\n"
             wicket_msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
             wicket_msg += f"🏏 {striker_tag} — <b>OUT!</b>\n"
-            wicket_msg += f"⚾ <b>{bowler.first_name}</b> takes the wicket!\n"
-            wicket_msg += f"🏃 {striker.runs} runs off {striker.balls_faced} balls\n"
             wicket_msg += f"💬 <i>{commentary}</i>"
             
-            _wkt_react = InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Amazing", callback_data=f"react_amazingw_{group_id}"), InlineKeyboardButton("😂 Funny", callback_data=f"react_funnyw_{group_id}"), InlineKeyboardButton("👏 Nice", callback_data=f"react_nicew_{group_id}")]])
+            _wkt_react = InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Amazing", callback_data=f"react_amazingw_{group_id}"), InlineKeyboardButton("😂 Funny", callback_data=f"react_funnyw_{group_id}")]])
             gif_url = get_random_gif(MatchEvent.WICKET)
             try:
                 await context.bot.send_animation(group_id, animation=gif_url, caption=wicket_msg, parse_mode=ParseMode.HTML, reply_markup=_wkt_react)
@@ -5907,6 +6102,8 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
             striker.balls_faced += 1
             bowler.balls_bowled += 1
             bowl_team.balls += 1
+            bat_team.balls += 1  # ✅ Sync batting team ball count
+            bat_team.update_overs()
             bowl_team.update_overs()
             
             # ✅ OFFER DRS
@@ -5917,7 +6114,7 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
                 "batsman_number": batsman_num
             }
             
-            if bat_team.drs_remaining > 0 and get_gc_setting(group_id, "drs_enabled", True):
+            if bat_team.drs_remaining > 0 and get_gc_setting(group_id, "drs_enabled", False):
                 await offer_drs_to_captain(context, group_id, match)
             else:
                 calculate_momentum_change(match, 0, True, False)
@@ -5935,9 +6132,12 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
         bowler.balls_bowled += 1
         bowler.runs_conceded += runs
         bowler.consecutive_wickets = 0  # 🔄 Reset consecutive wickets when runs scored
+        match.current_over_runs = getattr(match, 'current_over_runs', 0) + runs  # 📊 Track in-progress over runs
         
         # ✅ CRITICAL: INCREMENT BALLS HERE (BEFORE OVERS UPDATE)
         bowl_team.balls += 1
+        bat_team.balls += 1  # ✅ Sync batting team ball count
+        bat_team.update_overs()
         bowl_team.update_overs()
         
         # 🔮 MAGIC BALL MODE — Check for power-up ball
@@ -5961,6 +6161,7 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
                     striker.runs += delta
                     bowler.runs_conceded += delta
                 # Update player_stats for magic ball tracking
+                init_player_stats(striker.user_id)
                 if striker.user_id in player_stats:
                     mb = player_stats[striker.user_id].setdefault("magicball", {})
                     mb["magic_balls_triggered"] = mb.get("magic_balls_triggered", 0) + 1
@@ -6048,7 +6249,6 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
             _bnd_react = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔥 Wow!", callback_data=f"react_wow_{group_id}"),
                 InlineKeyboardButton("🚀 Smashed!", callback_data=f"react_smash_{group_id}"),
-                InlineKeyboardButton("😮 Unreal!", callback_data=f"react_unreal_{group_id}"),
             ]])
         # Send message
         try:
@@ -6059,6 +6259,19 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
         except:
             await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
         
+        # ✅ LOG BALL - runs scored
+        match.ball_by_ball_log.append({
+            "over": format_overs(bowl_team.balls),
+            "batsman": striker.first_name,
+            "bowler": bowler.first_name,
+            "batting_team": bat_team.name,
+            "runs": runs,
+            "wicket": False,
+            "is_wicket": False,
+            "wide": False,
+            "noball": False,
+        })
+
         # Swap batsmen on odd runs
         if runs % 2 == 1:
             bat_team.swap_batsmen()
@@ -6208,14 +6421,12 @@ async def check_wide_condition(match: Match, current_number: int) -> bool:
     if len(match.bowler_number_history) > 3:
         match.bowler_number_history.pop(0)
     
-    # 🔍 Check if last 3 are ALL same AND consecutive
+    # 🔍 Check if last 3 consecutive are ALL the same number
     if len(match.bowler_number_history) == 3:
-        # All three must be identical
         if (match.bowler_number_history[0] == match.bowler_number_history[1] == 
-            match.bowler_number_history[2] == current_number):
-            # ✅ LOG FOR DEBUGGING
+            match.bowler_number_history[2]):
+            # ✅ WIDE CONFIRMED
             logger.info(f"🚨 WIDE DETECTED! History: {match.bowler_number_history}")
-            # 🔄 Reset history after wide is called
             match.bowler_number_history = []
             return True
     
@@ -6281,7 +6492,6 @@ async def offer_drs(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Ma
     wicket_text += "━━━━━━━━━━━━━━━━━━━━━\n"
     wicket_text += f"  🔴 WICKET — BOWLED! \n"
     wicket_text += "━━━━━━━━━━━━━━━━━━━━━\n\n"
-    wicket_text += f"💬 <i>{commentary}</i>\n\n"
     wicket_text += f"🏏 <b>{batsman.first_name}:</b>  {batsman.runs} ({batsman.balls_faced})\n\n"
     wicket_text += f"🧢 Captain <b>{batting_captain.first_name}</b>: You have <b>{match.current_batting_team.drs_remaining} DRS</b> review available.\n"
     wicket_text += "📹 Challenge the decision? Use /drs\n"
@@ -6559,26 +6769,53 @@ async def confirm_wicket_and_continue(context: ContextTypes.DEFAULT_TYPE, group_
     match.current_over_wickets += 1
     bowler.consecutive_wickets += 1  # 🎯 Increment consecutive wickets for hat-trick
     
+    # ✅ LOG WICKET BALL
+    match.ball_by_ball_log.append({
+        "over": format_overs(bowl_team.balls),
+        "batsman": out_player.first_name,
+        "bowler": bowler.first_name,
+        "batting_team": bat_team.name,
+        "runs": 0,
+        "wicket": True,
+        "is_wicket": True,
+        "wide": False,
+        "noball": False,
+    })
+
     logger.info(f"✅ Wickets updated: Team={bat_team.wickets}, Bowler={bowler.wickets}, Consecutive={bowler.consecutive_wickets}")
     
     # 🎉 CHECK BOWLING MILESTONE
     await check_and_celebrate_milestones(context, group_id, match, bowler, 'bowling')
     
-    # 📄 Send Mini Scorecard
+    # 📄 Send Mini Scorecard with dynamic over-by-over bar chart
     try:
         mini_card = generate_mini_scorecard(match)
-        # Send with photo
+        # Try dynamic bar chart first
+        chart_sent = False
         try:
-            await context.bot.send_photo(
-                group_id,
-                photo=MINI_SCORECARD_PHOTO,
-                caption=mini_card,
-                parse_mode=ParseMode.HTML
-            )
-        except Exception as photo_error:
-            logger.error(f"Error sending mini scorecard photo: {photo_error}")
-            # Fallback to text
-            await context.bot.send_message(group_id, mini_card, parse_mode=ParseMode.HTML)
+            chart_bio = generate_over_bar_chart(match)
+            if chart_bio:
+                await context.bot.send_photo(
+                    group_id,
+                    photo=chart_bio,
+                    caption=mini_card,
+                    parse_mode=ParseMode.HTML
+                )
+                chart_sent = True
+        except Exception as chart_err:
+            logger.warning(f"Bar chart (wicket) failed: {chart_err}")
+        if not chart_sent:
+            # Fallback: static photo
+            try:
+                await context.bot.send_photo(
+                    group_id,
+                    photo=MINI_SCORECARD_PHOTO,
+                    caption=mini_card,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as photo_error:
+                logger.error(f"Error sending mini scorecard photo: {photo_error}")
+                await context.bot.send_message(group_id, mini_card, parse_mode=ParseMode.HTML)
         logger.info("📨 Mini scorecard sent")
     except Exception as e:
         logger.error(f"🚫 Failed to send mini scorecard: {e}")
@@ -6677,7 +6914,7 @@ async def check_drinks_break(context: ContextTypes.DEFAULT_TYPE, group_id: int, 
         msg += f"📊 <b>Score:</b> {bat_team.score}/{bat_team.wickets} ({format_overs(bat_team.balls)})\n\n"
         
         # 🧮 Calculate stats
-        overs_played = max(bat_team.overs, 0.1)
+        overs_played = max(bat_team.balls / 6, 0.1)
         crr = round(bat_team.score / overs_played, 2)
         msg += f"📈 <b>Current RR:</b> {crr}\n"
         
@@ -6735,21 +6972,45 @@ async def check_over_complete(context: ContextTypes.DEFAULT_TYPE, group_id: int,
     else:
         match.team_y_over_wickets.append(match.current_over_wickets)
     match.current_over_wickets = 0
-    # ✅ STEP 1: SEND MINI SCORECARD
+
+    # ✅ Save over runs for this completed over
+    if bat_team == match.team_x:
+        already_accounted = sum(match.team_x_over_runs)
+        runs_in_this_over = bat_team.score - already_accounted
+        match.team_x_over_runs.append(max(0, runs_in_this_over))
+    else:
+        already_accounted = sum(match.team_y_over_runs)
+        runs_in_this_over = bat_team.score - already_accounted
+        match.team_y_over_runs.append(max(0, runs_in_this_over))
+    match.current_over_runs = 0  # Reset for the next over
+    # ✅ STEP 1: SEND MINI SCORECARD with dynamic over-by-over bar chart
     mini_card = generate_mini_scorecard(match)
+    chart_sent2 = False
     try:
-        await context.bot.send_photo(
-            group_id,
-            photo=MINI_SCORECARD_PHOTO,
-            caption=mini_card,
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as photo_error:
-        logger.error(f"Error sending mini scorecard photo: {photo_error}")
-        # Fallback to text
-        await context.bot.send_message(group_id, mini_card, parse_mode=ParseMode.HTML)
+        chart_bio2 = generate_over_bar_chart(match)
+        if chart_bio2:
+            await context.bot.send_photo(
+                group_id,
+                photo=chart_bio2,
+                caption=mini_card,
+                parse_mode=ParseMode.HTML
+            )
+            chart_sent2 = True
+    except Exception as chart_err2:
+        logger.warning(f"Bar chart (over complete) failed: {chart_err2}")
+    if not chart_sent2:
+        try:
+            await context.bot.send_photo(
+                group_id,
+                photo=MINI_SCORECARD_PHOTO,
+                caption=mini_card,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as photo_error:
+            logger.error(f"Error sending mini scorecard photo: {photo_error}")
+            await context.bot.send_message(group_id, mini_card, parse_mode=ParseMode.HTML)
     logger.info("📨 Mini scorecard sent")
-    
+
     await asyncio.sleep(1)
     
     # ✅ STEP 2: SWAP BATSMEN (Strike Rotation)
@@ -6791,6 +7052,25 @@ async def check_over_complete(context: ContextTypes.DEFAULT_TYPE, group_id: int,
         summary += f"\n🎯 Need <b>{_needed}</b> off <b>{_bl}</b> balls  (RRR: {_rrr})"
     await context.bot.send_message(group_id, summary, parse_mode=ParseMode.HTML)
     logger.info("📨 Over summary sent to group")
+
+    # ── Mid-match random image every 2 overs (after over 2+ and randomly chosen)
+    try:
+        overs_done = len(match.team_x_over_runs) + len(match.team_y_over_runs)
+        last_img_over = mid_match_image_tracker.get(group_id, 0)
+        # Trigger if at least 2 overs since last image, with 50% random chance
+        if (overs_done - last_img_over) >= 2 and random.random() < 0.5:
+            mid_bio = generate_mid_match_image(match)
+            if mid_bio:
+                caption = _build_mid_match_caption(match)
+                await context.bot.send_photo(
+                    chat_id=group_id,
+                    photo=mid_bio,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML
+                )
+                mid_match_image_tracker[group_id] = overs_done
+    except Exception as mid_e:
+        logger.error(f"Mid-match image error: {mid_e}")
     
     # ✅ DRINKS BREAK CHECK (10th over = 60 balls)
     if bat_team.balls == 60:
@@ -7248,7 +7528,25 @@ async def bring_next_player(context: ContextTypes.DEFAULT_TYPE, chat_id: int, au
     
     # Check if auction complete
     if len(auction.player_pool) == 0:
-        await end_auction(context, chat_id, auction)
+        # Ask auctioneer/host for confirmation before officially ending
+        sold_count = len(auction.sold_players)
+        unsold_count = len(auction.unsold_players)
+        confirm_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, Conclude Auction", callback_data=f"confirm_endauction_{chat_id}"),
+            InlineKeyboardButton("❌ Keep Going", callback_data="cancel_endauction")
+        ]])
+        try:
+            await context.bot.send_message(
+                chat_id,
+                f"🏁 <b>ALL PLAYERS AUCTIONED!</b>\n\n"
+                f"✅ Sold: <b>{sold_count}</b>  |  ❌ Unsold: <b>{unsold_count}</b>\n\n"
+                f"Confirm to officially conclude the auction?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=confirm_kb
+            )
+        except Exception as e:
+            logger.error(f"bring_next_player end confirm error: {e}")
+            await end_auction(context, chat_id, auction)
         return
     
     # Get player
@@ -7258,6 +7556,7 @@ async def bring_next_player(context: ContextTypes.DEFAULT_TYPE, chat_id: int, au
     auction.current_base_price = player["base_price"]
     auction.current_highest_bid = player["base_price"]
     auction.current_highest_bidder = None
+    auction.last_bid_teams = []  # Reset bid history for new player
     
     # ✅ FIX: Set phase to AUCTION_LIVE
     auction.phase = AuctionPhase.AUCTION_LIVE
@@ -7497,7 +7796,6 @@ async def trigger_solo_ball(context, chat_id, match):
     msg += "━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"⚾ <b>{bowl_tag}</b> is going for run up...\n"
     msg += f"🔄 <b>Spell:</b> Ball {match.solo_balls_this_spell + 1}/3\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━"
     
     keyboard = [[InlineKeyboardButton("📩 Deliver Bowl", url=f"https://t.me/{context.bot.username}")]]
     
@@ -7510,7 +7808,7 @@ async def trigger_solo_ball(context, chat_id, match):
     # DM Bowler
     try:
         dm_msg = f"⚔️ <b>SOLO MATCH</b>\n"
-        dm_msg += f"🎯 Target: <b>{batter.first_name}</b> (Runs: {batter.runs})\n"
+        dm_msg += f"🎯 Batsman: <b>{batter.first_name}</b> (Runs: {batter.runs})\n"
         dm_msg += "👉 Send your number (0-6)"
         await context.bot.send_message(bowler.user_id, dm_msg, parse_mode=ParseMode.HTML)
         
@@ -7536,6 +7834,13 @@ async def process_solo_turn_result(context, chat_id, match):
         batter.is_out = True
         match.solo_balls_this_spell = 0
         
+        # Hat-trick tracking
+        if not hasattr(match, 'solo_consecutive_wickets'):
+            match.solo_consecutive_wickets = {}
+        bowler_key = bowler.user_id
+        match.solo_consecutive_wickets[bowler_key] = match.solo_consecutive_wickets.get(bowler_key, 0) + 1
+        hat_trick = match.solo_consecutive_wickets[bowler_key] >= 3
+        
         gif = get_random_gif(MatchEvent.WICKET)
         commentary = get_commentary("wicket", group_id=chat_id)
         sr = round((batter.runs / max(batter.balls_faced, 1)) * 100, 1)
@@ -7543,7 +7848,6 @@ async def process_solo_turn_result(context, chat_id, match):
         msg = f"❌ <b>OUT! {batter.first_name} is gone!</b>\n"
         msg += "━━━━━━━━━━━━━━━━━━━━━\n"
         msg += f"🏏 <b>Final Score:</b> {batter.runs} ({batter.balls_faced})\n"
-        msg += f"⚡ <b>Strike Rate:</b> {sr}\n"
         msg += f"💬 <i>{commentary}</i>"
 
         try:
@@ -7551,8 +7855,20 @@ async def process_solo_turn_result(context, chat_id, match):
             else: await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
         except:
             await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
-
-        # Move to NEXT Batsman
+        
+        # 🎩 Hat-trick celebration
+        if hat_trick:
+            ht_msg = (
+                f"🎩〔 <b>HAT-TRICK!</b> 〕🎩\n\n"
+                f"🔥 <b>{bowler.first_name}</b> takes 3 consecutive wickets!\n"
+                f"🏏 <i>Unbelievable bowling display!</i>"
+            )
+            try:
+                ht_gif = "https://media.tenor.com/HpTnkTq6h2IAAAAC/cricket-hattrick.gif"
+                await context.bot.send_animation(chat_id, ht_gif, caption=ht_msg, parse_mode=ParseMode.HTML)
+            except:
+                await context.bot.send_message(chat_id, ht_msg, parse_mode=ParseMode.HTML)
+            match.solo_consecutive_wickets[bowler_key] = 0  # Reset after hat-trick
         match.current_solo_bat_idx += 1
         
         # Check if ALL OUT
@@ -7583,6 +7899,11 @@ async def process_solo_turn_result(context, chat_id, match):
         batter.runs += runs
         batter.balls_faced += 1
         
+        # Reset consecutive wickets for this bowler (scored off)
+        if not hasattr(match, 'solo_consecutive_wickets'):
+            match.solo_consecutive_wickets = {}
+        match.solo_consecutive_wickets[bowler.user_id] = 0
+        
         # Map Run Events to GIFs
         events = {0: MatchEvent.DOT_BALL, 1: MatchEvent.RUNS_1, 2: MatchEvent.RUNS_2, 
                   3: MatchEvent.RUNS_3, 4: MatchEvent.RUNS_4, 5: MatchEvent.RUNS_5, 6: MatchEvent.RUNS_6}
@@ -7608,6 +7929,41 @@ async def process_solo_turn_result(context, chat_id, match):
 
         # Over/Spell Rotation (Every 3 balls)
         match.solo_balls_this_spell += 1
+
+        # ── 🎉 MILESTONE CELEBRATIONS ──
+        prev_runs = batter.runs - runs
+        # Fifty celebration
+        if prev_runs < 50 and batter.runs >= 50 and batter.runs < 100:
+            fifty_gifs = [
+                "https://media.tenor.com/UBE1qWoTtLAAAAAC/cricket-fifty.gif",
+                "https://media.tenor.com/xtBFMdQjRwUAAAAC/cricket-celebration.gif"
+            ]
+            cel_msg = (
+                f"🌟〔 <b>FIFTY!</b> 〕🌟\n\n"
+                f"🏏 <b>{batter.first_name}</b> reaches <b>50 runs</b>!\n"
+                f"📊 {batter.runs} ({batter.balls_faced})  SR: {sr}\n"
+                f"🎉 <i>Half-century milestone!</i>"
+            )
+            try:
+                await context.bot.send_animation(chat_id, random.choice(fifty_gifs), caption=cel_msg, parse_mode=ParseMode.HTML)
+            except:
+                await context.bot.send_message(chat_id, cel_msg, parse_mode=ParseMode.HTML)
+        # Hundred celebration
+        elif prev_runs < 100 and batter.runs >= 100:
+            hundred_gifs = [
+                "https://media.tenor.com/BK2xfqEUiGoAAAAC/cricket-century.gif",
+                "https://media.tenor.com/xtBFMdQjRwUAAAAC/cricket-celebration.gif"
+            ]
+            cel_msg = (
+                f"💯〔 <b>CENTURY!</b> 〕💯\n\n"
+                f"🏏 <b>{batter.first_name}</b> reaches <b>100 runs</b>!\n"
+                f"📊 {batter.runs} ({batter.balls_faced})  SR: {sr}\n"
+                f"🎊 <i>What a magnificent hundred!</i>"
+            )
+            try:
+                await context.bot.send_animation(chat_id, random.choice(hundred_gifs), caption=cel_msg, parse_mode=ParseMode.HTML)
+            except:
+                await context.bot.send_message(chat_id, cel_msg, parse_mode=ParseMode.HTML)
         if match.solo_balls_this_spell >= 3:
             match.solo_balls_this_spell = 0
             old_idx = match.current_solo_bowl_idx
@@ -7784,8 +8140,13 @@ async def end_solo_game_logic(context, chat_id, match):
             s["runs"] += p.runs
             s["balls"] += p.balls_faced
             s["wickets"] += p.wickets
+            s["sixes"]   = s.get("sixes", 0) + getattr(p, "sixes", 0)
+            s["fours"]   = s.get("fours", 0) + getattr(p, "boundaries", 0)
+            if p.runs >= 100: s["centuries"] = s.get("centuries", 0) + 1
+            elif p.runs >= 50: s["fifties"]  = s.get("fifties", 0) + 1
             if p.runs == 0 and p.is_out: s["ducks"] += 1
-            if p.runs > s["highest"]: s["highest"] = p.runs
+            if p.runs > s.get("highest", 0): s["highest"] = p.runs
+            if p.runs > s.get("high_score", 0): s["high_score"] = p.runs
             
             if p.user_id == winner.user_id: 
                 s["wins"] += 1
@@ -7794,18 +8155,6 @@ async def end_solo_game_logic(context, chat_id, match):
                 
     save_data()
 
-    # ✅ 1. NOTIFY ALL PLAYERS IN GC
-    winner_tag = f"<a href='tg://user?id={winner.user_id}'>{winner.first_name}</a>"
-    
-    notify_msg = f"🏁 <b>SOLO BATTLE ENDED!</b> 🏁\n"
-    notify_msg += "━━━━━━━━━━━━━━━━━━━━━\n"
-    notify_msg += f"🎊 <b>Winner:</b> {winner_tag}\n"
-    notify_msg += f"📊 <b>Final Score:</b> {winner.runs} runs\n\n"
-    notify_msg += f"<i>🏆 Congratulations to the champion!</i>\n"
-    notify_msg += f"<i>📋 Check /soloscore for final standings</i>"
-    
-    await context.bot.send_message(chat_id, notify_msg, parse_mode=ParseMode.HTML)
-    await asyncio.sleep(2)
 
     # ✅ 2. VICTORY GIF WITH DETAILED CARD
     winner_sr = round((winner.runs / winner.balls_faced) * 100, 1) if winner.balls_faced > 0 else 0
@@ -7818,6 +8167,7 @@ async def end_solo_game_logic(context, chat_id, match):
     msg += "━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     msg += "📊 <b>FINAL LEADERBOARD</b>\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n"
     medals = ["🥇", "🥈", "🥉"]
     
     for i, p in enumerate(sorted_players):
@@ -7828,7 +8178,16 @@ async def end_solo_game_logic(context, chat_id, match):
         
     msg += "━━━━━━━━━━━━━━━━━━━━━"
 
-    # Try sending with photo first
+    # Try sending with PIL-generated top3 image as champion card
+    try:
+        top3_bio = generate_solo_top3_image(sorted_players)
+        if top3_bio:
+            await context.bot.send_photo(chat_id, photo=top3_bio, caption=msg, parse_mode=ParseMode.HTML)
+            return
+    except Exception as e:
+        logger.error(f"Error sending solo end PIL photo: {e}")
+
+    # Fallback to SOLO_END_PHOTO file_id
     try:
         await context.bot.send_photo(chat_id, photo=SOLO_END_PHOTO, caption=msg, parse_mode=ParseMode.HTML)
         return
@@ -9124,7 +9483,7 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         first_innings_score = bat_team.score
         match.target = first_innings_score + 1
         
-        overs_played = max(bat_team.overs, 0.1)
+        overs_played = max(bat_team.balls / 6, 0.1)
         rr = round(bat_team.score / overs_played, 2)
 
         msg = "🌅 <b>INNINGS BREAK</b> 🌅\n"
@@ -9161,8 +9520,14 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         
         # Start 2nd innings
         match.innings = 2
+        match.current_over_runs = 0  # Reset for 2nd innings tracking
+        match.current_over_wickets = 0
         match.current_batting_team = match.get_other_team(match.current_batting_team)
         match.current_bowling_team = match.get_other_team(match.current_bowling_team)
+        
+        # ✅ FIX: Reset ball counts so 2nd innings always starts from ball 0
+        match.current_batting_team.balls = 0
+        match.current_bowling_team.balls = 0
         
         match.current_batting_team.current_batsman_idx = None
         match.current_batting_team.current_non_striker_idx = None
@@ -9177,14 +9542,11 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         start_msg = "🚀〔 <b>THE CHASE IS ON!</b> 〕🚀\n"
         start_msg += "━━━━━━━━━━━━━━━━━━━━━\n"
         start_msg += f"  🏏 {chase_team.name}  \n"
-        start_msg += "━━━━━━━━━━━━━━━━━━━━━\n\n"
         start_msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
         start_msg += "🧮 <b>CHASE EQUATION:</b>\n"
         start_msg += f"🎯 Need  <b>{runs_needed} runs</b>\n"
         start_msg += f"⚾ In  <b>{balls_available} balls</b>  ({match.total_overs} overs)\n"
         start_msg += f"📉 Required RR:  <b>{rrr}</b>\n"
-        start_msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
-        start_msg += "🍀 <i>Best of luck to both teams! Let the battle begin!</i>"
         
         await context.bot.send_message(group_id, start_msg, parse_mode=ParseMode.HTML)
         await asyncio.sleep(2)
@@ -9199,8 +9561,6 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
         msg += f"👉 <b>{captain_tag}</b>, who's walking in first?\n"
         msg += f"⌨️ <code>/batting [serial_number]</code>\n"
-        msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"⏱ <b>Batting Time:</b> 30 seconds"
 
         await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
         
@@ -9281,7 +9641,7 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
         # Update stats for tie
         try:
             await update_player_stats_after_match(match, None, None)
-            save_match_to_history(match, "TIE", "TIE")
+            save_match_to_history(match, "TIE")
         except: pass
         
         # Cleanup
@@ -9321,7 +9681,7 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
     try:
         logger.info("💾 Saving stats...")
         await update_player_stats_after_match(match, winner, loser)
-        save_match_to_history(match, winner.name, loser.name)
+        save_match_to_history(match, winner.name)
         update_h2h_stats(match)
         logger.info("✅ Stats saved successfully")
     except Exception as e:
@@ -9538,7 +9898,7 @@ async def testwin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Update stats for tie
         await update_player_stats_after_match(match, None, None)
-        save_match_to_history(match, "TIE", "TIE")
+        save_match_to_history(match, "TIE")
         
         # Cleanup
         try:
@@ -9576,7 +9936,7 @@ async def testwin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         logger.info("💾 Saving stats...")
         await update_player_stats_after_match(match, winner, loser)
-        save_match_to_history(match, winner.name, loser.name)
+        save_match_to_history(match, winner.name)
         update_h2h_stats(match)
         logger.info("✅ Stats saved successfully")
     except Exception as e:
@@ -9707,24 +10067,24 @@ async def send_final_scorecard(context: ContextTypes.DEFAULT_TYPE, group_id: int
     
     # Build Complete Scorecard
     msg = "📋 <b>OFFICIAL MATCH SCORECARD</b>\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "━━━━━━━━━━━━━━━━━━━\n"
     # Match Info
     msg += f"🏆 <b>Format:</b> {match.total_overs} Overs\n"
     msg += f"🏟 <b>Venue:</b> {match.group_name}\n"
     msg += f"📅 <b>Date:</b> {match.created_at.strftime('%d %b %Y')}\n\n"
-    msg += "══════════════════════\n\n"
+    msg += "═════════════════\n\n"
     
     # First Innings
     msg += "<b>🔹 FIRST INNINGS</b>\n\n"
     msg += format_batting_card(first_innings, 1)
     msg += format_bowling_card(second_innings, first_innings.name)
     
-    msg += "\n╠════════════════════╣\n"
+    msg += "\n╠════════════════╣\n"
     # Second Innings
     msg += "<b>🔸 SECOND INNINGS</b>\n\n"
     msg += format_batting_card(second_innings, 2)
     msg += format_bowling_card(first_innings, second_innings.name)
-    msg += "\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+    msg += "\n━━━━━━━━━━━━━━━━━\n\n"
     
     # Match Result
     winner = None
@@ -9763,6 +10123,1723 @@ async def send_final_scorecard(context: ContextTypes.DEFAULT_TYPE, group_id: int
     except:
         await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
 
+    # Send worm chart as image with full scorecard caption
+    try:
+        worm_bio = generate_worm_graph(match)
+        if worm_bio:
+            worm_caption = msg if len(msg) <= 1024 else msg[:1020] + "…"
+            await context.bot.send_photo(
+                chat_id=group_id,
+                photo=worm_bio,
+                caption=worm_caption,
+                parse_mode=ParseMode.HTML
+            )
+    except Exception as worm_e:
+        logger.error(f"Worm graph send error: {worm_e}")
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║         4K IMAGE GENERATORS  (PIL · 3840×2160)                 ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+_IMG4K_W, _IMG4K_H = 3840, 2160   # true 4K
+
+
+# ─────────────────────────────────────────────────────────────────
+#  WORM GRAPH (Score Progression with Wicket Fall)  BLACK BG
+# ─────────────────────────────────────────────────────────────────
+def generate_worm_graph(match) -> Optional[BytesIO]:
+    """
+    📈 HD Worm / Score-Progression Chart.
+    Team X = electric blue, Team Y = hot red. Wicket markers = red cricket ball icon.
+    Works for mid-match (1st innings only) and full match (both innings).
+    """
+    try:
+        W, H = 1400, 800
+        PAD_L, PAD_R, PAD_T, PAD_B = 100, 50, 90, 110
+        CHART_W = W - PAD_L - PAD_R
+        CHART_H = H - PAD_T - PAD_B
+
+        img = Image.new("RGB", (W, H), (10, 10, 22))
+        draw = ImageDraw.Draw(img)
+
+        C_X      = (60, 180, 255)
+        C_Y      = (255, 70, 70)
+        C_GOLD   = (255, 200, 50)
+        C_GRAY   = (120, 140, 180)
+        C_GRID   = (25, 35, 65)
+        C_WHITE  = (230, 240, 255)
+        C_WBALL  = (190, 30, 30)   # cricket ball red
+
+        fn_title = _get_font(True, 50)
+        fn_bold  = _get_font(True, 36)
+        fn_reg   = _get_font(False, 28)
+        fn_sm    = _get_font(False, 24)
+
+        def build_cumulative(runs_list, current_over_runs=0):
+            """Build cumulative run line including in-progress over."""
+            pts = [0]
+            c = 0
+            for r in runs_list:
+                c += r
+                pts.append(c)
+            # Add current in-progress over if any runs scored
+            if current_over_runs > 0:
+                pts.append(c + current_over_runs)
+            return pts
+
+        # Determine which team is batting and build correct data
+        x_runs = list(match.team_x_over_runs)
+        y_runs = list(match.team_y_over_runs)
+        x_wkts = list(getattr(match, 'team_x_over_wickets', []))
+        y_wkts = list(getattr(match, 'team_y_over_wickets', []))
+
+        # Include in-progress over runs for current batting team
+        cur_over = getattr(match, 'current_over_runs', 0)
+        bat_team = getattr(match, 'current_batting_team', None)
+
+        # Build cumulative scores, accounting for in-progress over
+        if bat_team is not None and bat_team == match.team_x and cur_over > 0:
+            x_scores = build_cumulative(x_runs, cur_over)
+            y_scores = build_cumulative(y_runs)
+        elif bat_team is not None and bat_team != match.team_x and cur_over > 0:
+            x_scores = build_cumulative(x_runs)
+            y_scores = build_cumulative(y_runs, cur_over)
+        else:
+            x_scores = build_cumulative(x_runs)
+            y_scores = build_cumulative(y_runs)
+
+        max_score = max(
+            max(x_scores, default=0),
+            max(y_scores, default=0),
+            10
+        ) + 15
+        total_pts = max(len(x_scores), len(y_scores), 2)
+        n_overs   = total_pts - 1
+
+        # ── Grid lines
+        y_steps = 6
+        for j in range(y_steps + 1):
+            val = int(j * max_score / y_steps)
+            gy  = PAD_T + CHART_H - int(j * CHART_H / y_steps)
+            draw.line([(PAD_L, gy), (PAD_L + CHART_W, gy)], fill=C_GRID, width=1)
+            draw.text((8, gy - 14), str(val), font=fn_reg, fill=C_GRAY)
+
+        x_steps_grid = min(n_overs, 20)
+        for i in range(x_steps_grid + 1):
+            gx = PAD_L + int(i / max(x_steps_grid, 1) * CHART_W)
+            draw.line([(gx, PAD_T), (gx, PAD_T + CHART_H)], fill=C_GRID, width=1)
+            bb = draw.textbbox((0, 0), str(i), font=fn_reg)
+            tw = bb[2] - bb[0]
+            draw.text((gx - tw // 2, PAD_T + CHART_H + 12), str(i), font=fn_reg, fill=C_GRAY)
+
+        def to_px(over_idx, score, total):
+            px = PAD_L + int(over_idx / max(total - 1, 1) * CHART_W)
+            py = PAD_T + CHART_H - int(score / max_score * CHART_H)
+            return px, py
+
+        def draw_line(scores, color, wkts_list, dotted=False):
+            pts = [to_px(i, s, len(scores)) for i, s in enumerate(scores)]
+            if len(pts) < 2:
+                return
+            glow = tuple(max(0, c - 110) for c in color)
+            # Glow pass
+            for i in range(len(pts) - 1):
+                for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
+                    draw.line(
+                        [(pts[i][0]+dx, pts[i][1]+dy), (pts[i+1][0]+dx, pts[i+1][1]+dy)],
+                        fill=glow, width=3
+                    )
+            # Main line (dotted for in-progress last segment)
+            for i in range(len(pts) - 1):
+                is_last = (i == len(pts) - 2)
+                if dotted and is_last:
+                    # Dashed line for in-progress over
+                    x1, y1 = pts[i]
+                    x2, y2 = pts[i+1]
+                    steps = max(abs(x2-x1), abs(y2-y1), 1)
+                    for s in range(0, steps, 12):
+                        if s % 24 < 12:
+                            sx1 = x1 + int(s / steps * (x2-x1))
+                            sy1 = y1 + int(s / steps * (y2-y1))
+                            sx2 = x1 + int(min(s+8, steps) / steps * (x2-x1))
+                            sy2 = y1 + int(min(s+8, steps) / steps * (y2-y1))
+                            draw.line([(sx1, sy1), (sx2, sy2)], fill=color, width=4)
+                else:
+                    draw.line([pts[i], pts[i+1]], fill=color, width=4)
+            # Dots and wicket markers
+            for i, (px, py) in enumerate(pts):
+                if i == len(pts) - 1 and dotted:
+                    # Live dot - pulsing larger
+                    draw.ellipse([px-9, py-9, px+9, py+9], fill=color, outline=(255,255,255))
+                else:
+                    draw.ellipse([px-6, py-6, px+6, py+6], fill=color, outline=(255,255,255))
+                # Wicket: cricket ball marker
+                if i > 0 and i - 1 < len(wkts_list) and wkts_list[i - 1] > 0:
+                    draw.ellipse([px-13, py-13, px+13, py+13], fill=C_WBALL, outline=C_GOLD)
+                    bb_w = draw.textbbox((0, 0), "W", font=fn_sm)
+                    draw.text((px - (bb_w[2]-bb_w[0])//2, py - (bb_w[3]-bb_w[1])//2 - 1), "W", font=fn_sm, fill=(255, 255, 255))
+
+        # Draw lines: dotted last segment if current over has in-progress runs
+        x_dotted = (bat_team == match.team_x and cur_over > 0) if bat_team else False
+        y_dotted = (bat_team is not None and bat_team != match.team_x and cur_over > 0) if bat_team else False
+
+        draw_line(x_scores, C_X, x_wkts, dotted=x_dotted)
+        if len(y_scores) > 1 or (len(y_scores) == 1 and y_scores[0] > 0):
+            draw_line(y_scores, C_Y, y_wkts, dotted=y_dotted)
+
+        # ── Axes
+        draw.line([(PAD_L, PAD_T), (PAD_L, PAD_T + CHART_H)], fill=C_GRAY, width=3)
+        draw.line([(PAD_L, PAD_T + CHART_H), (PAD_L + CHART_W, PAD_T + CHART_H)], fill=C_GRAY, width=3)
+
+        # ── Axis label
+        bb_ol = draw.textbbox((0, 0), "Overs", font=fn_reg)
+        draw.text(((W - (bb_ol[2] - bb_ol[0])) // 2, PAD_T + CHART_H + 70), "Overs", font=fn_reg, fill=C_GRAY)
+
+        # ── Title
+        title_str = f"SCORE PROGRESSION  —  {match.team_x.name} vs {match.team_y.name}"
+        bb_t = draw.textbbox((0, 0), title_str, font=fn_title)
+        draw.text(((W - (bb_t[2] - bb_t[0])) // 2, 18), title_str, font=fn_title, fill=C_GOLD)
+
+        # ── Legend
+        x_final = x_scores[-1] if x_scores else 0
+        x_wkts_total = sum(x_wkts)
+        y_final = y_scores[-1] if y_scores else 0
+        y_wkts_total = sum(y_wkts)
+
+        lx = PAD_L
+        draw.rectangle([lx, H - 72, lx + 28, H - 50], fill=C_X)
+        x_lbl = f"{match.team_x.name[:18]}  {x_final}/{x_wkts_total}"
+        draw.text((lx + 36, H - 74), x_lbl, font=fn_bold, fill=C_X)
+
+        lx2 = lx + max(350, len(x_lbl) * 14)
+        draw.rectangle([lx2, H - 72, lx2 + 28, H - 50], fill=C_Y)
+        y_lbl = f"{match.team_y.name[:18]}  {y_final}/{y_wkts_total}"
+        draw.text((lx2 + 36, H - 74), y_lbl, font=fn_bold, fill=C_Y)
+
+        # Wicket legend
+        draw.ellipse([W - 100, H - 70, W - 76, H - 46], fill=C_WBALL, outline=C_GOLD)
+        draw.text((W - 72, H - 72), "= W", font=fn_reg, fill=C_GRAY)
+
+        # ── Branding
+        brand = "CricoVerse"
+        bb_b = draw.textbbox((0, 0), brand, font=fn_sm)
+        draw.text((W - (bb_b[2]-bb_b[0]) - 15, H - 30), brand, font=fn_sm, fill=(45, 55, 95))
+
+        bio = BytesIO()
+        img.save(bio, "PNG", optimize=True)
+        bio.seek(0)
+        return bio
+    except Exception as e:
+        logger.error(f"Worm graph error: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────
+#  MATCH SUMMARY IMAGE  (PIL · black bg, professional design)
+# ─────────────────────────────────────────────────────────────────
+def _draw_ultimate_glow_panel(draw, img, x1, y1, x2, y2, color, alpha=40):
+    """Draws a glassmorphism panel with a neon outer glow."""
+    # 1. Subtle Outer Glow (using a larger blurred rectangle)
+    glow_margin = 15
+    glow_rect = [x1-glow_margin, y1-glow_margin, x2+glow_margin, y2+glow_margin]
+    
+    # 2. Main Glass Panel
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ol_draw = ImageDraw.Draw(overlay)
+    
+    # Glass fill (Dark translucent)
+    fill_c = (10, 15, 35, 200) 
+    _draw_rounded_rect_rgba(ol_draw, (x1, y1, x2, y2), 30, fill=fill_c, outline=color, width=4)
+    
+    # Merge glass effect
+    img.paste(Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB"))
+
+def generate_ultimate_match_summary(match, winner_name: str) -> Optional[BytesIO]:
+    try:
+        W, H = 1080, 1920
+        img = Image.new("RGB", (W, H), (5, 10, 25))
+        draw = ImageDraw.Draw(img)
+
+        # --- COLORS ---
+        C_GOLD = (255, 215, 0)
+        C_X = (0, 230, 255)    # Cyber Blue
+        C_Y = (255, 45, 130)   # Vivid Pink
+        C_WIN = (0, 255, 130)  # Emerald Green
+        C_WHITE = (245, 250, 255)
+        C_SUB = (160, 175, 200)
+
+        # --- BACKGROUND ---
+        # 3-Tone Deep Gradient
+        for i in range(H):
+            ratio = i / H
+            if ratio < 0.5:
+                r = int(5 + (15-5)*(ratio*2))
+                g = int(10 + (25-10)*(ratio*2))
+                b = int(25 + (60-25)*(ratio*2))
+            else:
+                r = int(15 + (10-15)*((ratio-0.5)*2))
+                g = int(25 + (15-25)*((ratio-0.5)*2))
+                b = int(60 + (40-60)*((ratio-0.5)*2))
+            draw.line([(0, i), (W, i)], fill=(r, g, b))
+
+        # --- HEADER (EPIC SLANT) ---
+        draw.polygon([(0, 0), (W, 0), (W, 180), (0, 260)], fill=(8, 12, 30))
+        draw.text((60, 60), "MATCH SUMMARY", font=_get_font(True, 100), fill=C_GOLD)
+        draw.rectangle([60, 175, 500, 182], fill=C_GOLD) # Gold accent line
+
+        # --- RESULT BANNER (NEON STRIP) ---
+        draw.rectangle([0, 280, W, 390], fill=(20, 40, 30))
+        draw.line([(0, 280), (W, 280)], fill=C_WIN, width=3)
+        draw.line([(0, 390), (W, 390)], fill=C_WIN, width=3)
+        
+        result_text = f"🏆 {winner_name.upper()} WON BY {match.margin_text.upper()} 🏆"
+        draw.text((W//2, 305), result_text, font=_get_font(True, 60), fill=C_WHITE, anchor="mt")
+
+        # --- TEAM PANELS ---
+        teams = [(match.batting_first, C_X, 430), 
+                 (match.get_other_team(match.batting_first), C_Y, 1080)]
+
+        for team, accent, py in teams:
+            # Draw Glass Panel
+            _draw_ultimate_glow_panel(draw, img, 40, py, W-40, py + 620, accent)
+            
+            # Team Name & Score
+            draw.text((80, py + 40), team.name.upper(), font=_get_font(True, 65), fill=accent)
+            draw.text((80, py + 120), f"{team.score}/{team.wickets}", font=_get_font(True, 110), fill=C_WHITE)
+            
+            # Stats Pill (Overs & RR)
+            rr = round(team.score / max(team.balls / 6, 0.1), 2)
+            ov_txt = f"{format_overs(team.balls)} OV  •  {rr} RR"
+            draw.rectangle([W-450, py+50, W-80, py+110], fill=(30, 45, 80), outline=accent, width=2)
+            draw.text((W-265, py+60), ov_txt, font=_get_font(True, 32), fill=C_WHITE, anchor="mt")
+
+            # --- TOP PERFORMERS ---
+            draw.text((80, py + 260), "TOP BATSMEN", font=_get_font(True, 38), fill=C_GOLD)
+            draw.line([(80, py + 305), (320, py + 305)], fill=C_GOLD, width=3)
+
+            # Batting Loop
+            batters = sorted([p for p in team.players if p.balls_faced > 0], key=lambda x: x.runs, reverse=True)[:3]
+            for i, p in enumerate(batters):
+                yy = py + 330 + (i * 70)
+                draw.text((100, yy), f"{p.first_name[:15].upper()}", font=_get_font(False, 36), fill=C_WHITE)
+                score_str = f"{p.runs} ({p.balls_faced})"
+                draw.text((W-100, yy), score_str, font=_get_font(True, 36), fill=C_WHITE, anchor="ra")
+
+        # --- PLAYER OF THE MATCH (GRAND FINALE) ---
+        potm_y = 1730
+        draw.polygon([(40, potm_y), (W-40, potm_y), (W-10, potm_y+140), (10, potm_y+140)], fill=(15, 20, 45), outline=C_GOLD, width=3)
+        
+        potm = max(match.team_x.players + match.team_y.players, key=lambda p: (p.runs * 1.2) + (p.wickets * 25))
+        draw.text((W//2, potm_y + 20), "PLAYER OF THE MATCH", font=_get_font(True, 35), fill=C_GOLD, anchor="mt")
+        potm_stats = f"{potm.name.upper()}  •  {potm.runs} Runs & {potm.wickets} Wkts"
+        draw.text((W//2, potm_y + 65), potm_stats, font=_get_font(True, 50), fill=C_WHITE, anchor="mt")
+
+        # Branding Footer
+        draw.text((W//2, H-50), "CRICOVERSE • THE ULTIMATE EXPERIENCE", font=_get_font(False, 26), fill=C_SUB, anchor="mt")
+
+        bio = BytesIO()
+        img.save(bio, "PNG")
+        bio.seek(0)
+        return bio
+    except Exception as e:
+        print(f"Grand Template Error: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────
+#  MID-MATCH LIVE SCORE CARD IMAGE (sent randomly every 2 overs)
+# ─────────────────────────────────────────────────────────────────
+def generate_mid_match_image(match) -> Optional[BytesIO]:
+    """
+    🔴 GOD-TIER 1080p Live Match Dashboard — Ultra Enhanced:
+    • Broadcast-quality glassmorphism panels with team-colored glows
+    • Massive dynamic score typography
+    • Neon-accented Current Batsmen & Bowler cards
+    • Last 6 balls modern glowing badges
+    • Deep space aurora animated-style background
+    • Cricora premium live footer
+    """
+    try:
+        import math
+        from io import BytesIO
+        from PIL import Image, ImageDraw
+
+        W, H = 1920, 1080
+        img = Image.new("RGB", (W, H), (4, 5, 14))
+        
+        # ── Ultimate Deep Space Background ──
+        _draw_multi_gradient_bg(img, [
+            (4,   6,  16),
+            (10, 14,  35),
+            (6,   9,  26),
+            (14, 20,  45),
+            (5,   8,  20),
+        ])
+        draw = ImageDraw.Draw(img)
+
+        # Subtle neon grid for tactical feel
+        for gx in range(0, W, 240):
+            draw.line([(gx, 0), (gx, H)], fill=(18, 26, 55), width=1)
+        for gy in range(0, H, 240):
+            draw.line([(0, gy), (W, gy)], fill=(18, 26, 55), width=1)
+
+        # ── Palette ──
+        C_GOLD    = (255, 215, 70)
+        C_WHITE   = (245, 250, 255)
+        C_GRAY    = (160, 175, 210)
+        C_X       = (70, 185, 255)  # Electric Blue
+        C_Y       = (255, 85, 130)  # Hot Pink
+        C_GREEN   = (55, 240, 130)
+        C_RED     = (240, 70, 80)
+        C_PANEL   = (14, 18, 42)
+        C_SEP     = (45, 60, 120)
+
+        # ── Typography ──
+        fn_huge = _get_font(True, 140)
+        fn_big  = _get_font(True, 96)
+        fn_hdr  = _get_font(True, 64)
+        fn_med  = _get_font(True, 52)
+        fn_sml  = _get_font(False, 42)
+        fn_tiny = _get_font(False, 32)
+
+        # ══════════════════════════════════════════════════════
+        # PREMIUM HEADER
+        # ══════════════════════════════════════════════════════
+        _draw_rounded_rect(draw, (80, 30, W - 80, 150), radius=35, fill=(16, 22, 52))
+        _draw_rounded_rect(draw, (80, 30, W - 80, 150), radius=35, outline=C_RED, width=4)
+        _draw_text_centered_glow(draw, "🔴  LIVE MATCH", W//2, 60, fn_hdr, C_WHITE, glow_color=(200, 40, 40))
+
+        bat_team  = match.current_batting_team
+        bowl_team = match.current_bowling_team
+
+        if bat_team and bowl_team:
+            bat_color  = C_X if bat_team == match.team_x else C_Y
+            bowl_color = C_Y if bat_team == match.team_x else C_X
+
+            # ══════════════════════════════════════════════════════
+            # MAIN SCORE CARDS (Top Half)
+            # ══════════════════════════════════════════════════════
+            # Batting Team (Left) - Bigger and bolder
+            _draw_rounded_rect(draw, (80, 190, W//2 - 20, 520), radius=40, fill=C_PANEL)
+            _draw_rounded_rect(draw, (80, 190, W//2 - 20, 520), radius=40, outline=bat_color, width=5)
+            
+            # Inner glow for batting team
+            for gw in range(20, 0, -5):
+                ga = gw / 20 * 0.2
+                gc = tuple(max(0, min(255, int(bat_color[i]*ga))) for i in range(3))
+                _draw_rounded_rect(draw, (80+gw, 190+gw, W//2-20-gw, 520-gw), radius=35, outline=gc, width=2)
+
+            draw.text((130, 230), f"🏏 {bat_team.name.upper()}", font=fn_hdr, fill=bat_color)
+            
+            score_txt = f"{bat_team.score}/{bat_team.wickets}"
+            ov_txt    = f"({format_overs(bat_team.balls)} ov)"
+            _draw_text_centered_glow(draw, score_txt, 340, 310, fn_huge, C_WHITE, glow_color=bat_color)
+            draw.text((580, 360), ov_txt, font=fn_big, fill=C_GRAY)
+
+            rr = round(bat_team.score / max(bat_team.balls / 6, 0.1), 2)
+            draw.text((130, 440), f"CRR: {rr}", font=fn_sml, fill=C_WHITE)
+
+            if match.innings == 2 and match.target > 0:
+                needed = match.target - bat_team.score
+                bl = (match.total_overs * 6) - bat_team.balls
+                rrr = round(needed / max(bl / 6, 0.1), 2)
+                rrr_color = C_RED if rrr > 12 else C_GOLD if rrr > 8 else C_GREEN
+                draw.text((500, 440), f"NEED {needed} OFF {bl}b", font=fn_sml, fill=C_GOLD)
+                draw.text((800, 440), f"RRR: {rrr}", font=fn_sml, fill=rrr_color)
+
+            # Bowling Team (Right) - Slightly subdued
+            _draw_rounded_rect(draw, (W//2 + 20, 190, W - 80, 520), radius=40, fill=(12, 16, 38))
+            _draw_rounded_rect(draw, (W//2 + 20, 190, W - 80, 520), radius=40, outline=bowl_color, width=3)
+            
+            draw.text((W//2 + 70, 230), f"⚾ {bowl_team.name.upper()}", font=fn_hdr, fill=bowl_color)
+            draw.text((W//2 + 70, 330), f"{bowl_team.score}/{bowl_team.wickets}", font=fn_huge, fill=(200, 210, 230))
+            draw.text((W//2 + 70, 440), f"Bowling Phase", font=fn_sml, fill=C_GRAY)
+
+            # ══════════════════════════════════════════════════════
+            # CURRENT PLAYERS (Bottom Half)
+            # ══════════════════════════════════════════════════════
+            # Current Batsmen
+            _draw_rounded_rect(draw, (80, 560, W//2 - 20, 850), radius=30, fill=(16, 22, 52))
+            draw.line([(80, 640), (W//2 - 20, 640)], fill=C_SEP, width=3)
+            draw.text((120, 575), "AT THE CREASE", font=fn_med, fill=C_GOLD)
+
+            striker    = bat_team.players[bat_team.current_batsman_idx] if bat_team.current_batsman_idx is not None else None
+            nonstriker = bat_team.players[bat_team.current_non_striker_idx] if bat_team.current_non_striker_idx is not None else None
+            
+            if striker:
+                sr_s = round((striker.runs / max(striker.balls_faced, 1)) * 100, 1)
+                draw.text((120, 660), f"★ {striker.first_name[:16]}", font=fn_hdr, fill=C_WHITE)
+                draw.text((580, 665), f"{striker.runs} ({striker.balls_faced})", font=fn_hdr, fill=C_GREEN)
+                draw.text((800, 675), f"SR: {sr_s}", font=fn_sml, fill=C_GRAY)
+            
+            if nonstriker:
+                sr_n = round((nonstriker.runs / max(nonstriker.balls_faced, 1)) * 100, 1)
+                draw.text((120, 750), f"  {nonstriker.first_name[:16]}", font=fn_med, fill=C_GRAY)
+                draw.text((580, 750), f"{nonstriker.runs} ({nonstriker.balls_faced})", font=fn_med, fill=C_GRAY)
+                draw.text((800, 755), f"SR: {sr_n}", font=fn_tiny, fill=(120, 130, 160))
+
+            # Current Bowler
+            _draw_rounded_rect(draw, (W//2 + 20, 560, W - 80, 850), radius=30, fill=(16, 22, 52))
+            draw.line([(W//2 + 20, 640), (W - 80, 640)], fill=C_SEP, width=3)
+            draw.text((W//2 + 60, 575), "CURRENT BOWLER", font=fn_med, fill=C_GOLD)
+
+            if bowl_team.current_bowler_idx is not None and bowl_team.current_bowler_idx < len(bowl_team.players):
+                bowler = bowl_team.players[bowl_team.current_bowler_idx]
+                eco    = bowler.get_economy()
+                ov_txt = format_overs(bowler.balls_bowled)
+                
+                draw.text((W//2 + 60, 660), f"⚡ {bowler.first_name[:16]}", font=fn_hdr, fill=C_WHITE)
+                draw.text((W//2 + 580, 665), f"{bowler.wickets}/{bowler.runs_conceded}", font=fn_hdr, fill=C_Y)
+                draw.text((W//2 + 60, 750), f"{ov_txt} Overs Bowled", font=fn_med, fill=C_GRAY)
+                
+                eco_color = C_GREEN if float(eco) < 7.0 else C_RED if float(eco) > 10.0 else C_WHITE
+                draw.text((W//2 + 580, 750), f"Eco: {eco}", font=fn_med, fill=eco_color)
+
+            # Central Partnership Pill (Overlay)
+            if match.current_partnership_runs > 0:
+                _draw_rounded_rect(draw, (W//2 - 220, 520, W//2 + 220, 580), radius=30, fill=C_PANEL, outline=C_GOLD, width=3)
+                _draw_text_centered(draw, f"🤝 Partnership: {match.current_partnership_runs} ({match.current_partnership_balls}b)", W//2, 532, fn_sml, C_GOLD)
+
+            # ══════════════════════════════════════════════════════
+            # LAST 6 BALLS (Modern Glow Badges)
+            # ══════════════════════════════════════════════════════
+            last6 = match.last_6_balls[-6:]
+            if last6:
+                _draw_rounded_rect(draw, (W//2 - 450, 880, W//2 + 450, 1000), radius=60, fill=(12, 16, 38), outline=C_SEP, width=2)
+                draw.text((W//2 - 400, 920), "Recent:", font=fn_med, fill=C_GRAY)
+                
+                start_x = W//2 - 200
+                for bi, ball in enumerate(last6):
+                    r = ball if isinstance(ball, int) else ball.get("runs", 0)
+                    w = ball.get("wicket", False) if isinstance(ball, dict) else False
+                    
+                    if w:      bc, glow, label = C_RED, (255, 60, 60), "W"
+                    elif r>=6: bc, glow, label = (180, 70, 255), (220, 140, 255), str(r)
+                    elif r>=4: bc, glow, label = (30, 160, 255), (100, 200, 255), str(r)
+                    elif r==0: bc, glow, label = (70, 75, 115), (90, 100, 160), "·"
+                    else:      bc, glow, label = (50, 200, 90), (100, 255, 140), str(r)
+
+                    bx = start_x + bi * 100
+                    by = 910
+                    
+                    # Outer glow for the ball
+                    for gw in range(15, 0, -5):
+                        ga = gw / 15 * 0.3
+                        gc = tuple(max(0, min(255, int(glow[i]*ga))) for i in range(3))
+                        draw.ellipse([(bx-gw, by-gw), (bx+70+gw, by+70+gw)], fill=gc)
+                        
+                    draw.ellipse([(bx, by), (bx+70, by+70)], fill=bc)
+                    _draw_text_centered(draw, label, bx+35, by+12, fn_med, C_WHITE)
+
+        # ══════════════════════════════════════════════════════
+        # CRICORA BRANDING FOOTER
+        # ══════════════════════════════════════════════════════
+        _draw_text_centered_glow(draw, "⚡ Cricoverse |  Live Match Center", W//2, 1030, fn_tiny, C_GRAY)
+
+        bio = BytesIO()
+        img.save(bio, "PNG", optimize=True)
+        bio.seek(0)
+        return bio
+        
+    except Exception as e:
+        logger.error(f"Mid-match image error: {e}")
+        import traceback; logger.error(traceback.format_exc())
+        return None
+
+# ─────────────────────────────────────────────────────────────────
+#  SOLO TOP BATSMEN IMAGE  (sent at solo game end)
+# ─────────────────────────────────────────────────────────────────
+def generate_solo_top3_image(sorted_players) -> Optional[BytesIO]:
+    """
+    🏆 GOD-TIER 4K Solo Top-3 Podium:
+    • 1st, 2nd, 3rd Place Pedestal Layout (Podium Style)
+    • Glassmorphism ranking cards with Gold/Silver/Bronze glows
+    • Deep space aurora background with victory particles
+    • Neon typography & strike-rate highlights
+    • Cricora & gaming zone branding
+    """
+    try:
+        import math, random
+        from io import BytesIO
+        from PIL import Image, ImageDraw
+
+        # Upgraded to 1080p canvas for God-Level spacing
+        W, H = 1920, 1080
+        img = Image.new("RGB", (W, H), (4, 5, 14))
+        
+        # ── Ultimate Victory Background ──
+        _draw_multi_gradient_bg(img, [
+            (6,   8,  20),
+            (12, 16,  45),
+            (8,  12,  30),
+            (16, 22,  60),
+            (5,   8,  20),
+        ])
+        draw = ImageDraw.Draw(img)
+
+        # Subtle victory rays radiating from center
+        cx_bg, cy_bg = W // 2, H // 2 + 100
+        for angle in range(0, 360, 15):
+            rad = math.radians(angle)
+            ex = cx_bg + 1500 * math.cos(rad)
+            ey = cy_bg + 1500 * math.sin(rad)
+            draw.line([(cx_bg, cy_bg), (ex, ey)], fill=(20, 28, 65), width=2)
+
+        # ── Color Palette ──
+        C_PANEL   = (14, 18, 42)
+        C_WHITE   = (245, 250, 255)
+        C_GRAY    = (160, 175, 210)
+        C_WIN     = (55, 240, 120)
+        
+        # Medal Themes: (Emoji, Base Color, Glow Color)
+        themes = [
+            ("🥇", (255, 210, 50),  (255, 235, 120)), # Rank 1 - Gold
+            ("🥈", (190, 195, 205), (230, 240, 255)), # Rank 2 - Silver
+            ("🥉", (210, 120, 60),  (240, 160, 90))   # Rank 3 - Bronze
+        ]
+
+        # ── Fonts ──
+        fn_huge = _get_font(True,  110)
+        fn_big  = _get_font(True,  84)
+        fn_hdr  = _get_font(True,  64)
+        fn_med  = _get_font(True,  52)
+        fn_sml  = _get_font(False, 42)
+        fn_tiny = _get_font(False, 34)
+
+        # ══════════════════════════════════════════════════════
+        # PREMIUM HEADER
+        # ══════════════════════════════════════════════════════
+        _draw_rounded_rect(draw, (80, 40, W - 80, 200), radius=40, fill=(16, 22, 52))
+        _draw_rounded_rect(draw, (80, 40, W - 80, 200), radius=40, outline=themes[0][1], width=5)
+        
+        _draw_text_centered_glow(draw, "⚔️  SOLO BATTLE RESULTS  ⚔️", W//2, 75, fn_big, themes[0][1], glow_color=(180, 120, 0))
+
+        # ══════════════════════════════════════════════════════
+        # PODIUM LOGIC (2nd -- 1st -- 3rd)
+        # ══════════════════════════════════════════════════════
+        top3 = sorted_players[:3]
+        
+        # display_slots: (Player, Rank_Index, Center_X, Start_Y, Card_Width, Card_Height)
+        slots = []
+        if len(top3) == 1:
+            slots = [(top3[0], 0, W//2, 280, 540, 600)]
+        elif len(top3) == 2:
+            slots = [
+                (top3[1], 1, W//2 - 350, 380, 480, 500), # 2nd
+                (top3[0], 0, W//2 + 350, 280, 540, 600)  # 1st
+            ]
+        elif len(top3) >= 3:
+            slots = [
+                (top3[1], 1, W//2 - 580, 380, 480, 500), # 2nd Left
+                (top3[0], 0, W//2,       250, 560, 640), # 1st Center (Highest)
+                (top3[2], 2, W//2 + 580, 440, 480, 440)  # 3rd Right
+            ]
+
+        for p, rank_idx, cx, sy, cw, ch in slots:
+            emoji, color, glow = themes[rank_idx]
+            px1, px2 = cx - cw // 2, cx + cw // 2
+            py1, py2 = sy, sy + ch
+            
+            # Draw glowing shadow for the card
+            for gw in range(20, 0, -4):
+                ga = gw / 20 * 0.3
+                gc = tuple(max(0, min(255, int(glow[i]*ga))) for i in range(3))
+                if any(c > 0 for c in gc):
+                    _draw_rounded_rect(draw, (px1-gw, py1-gw, px2+gw, py2+gw), radius=35, fill=gc)
+
+            # Card Body
+            _draw_rounded_rect(draw, (px1, py1, px2, py2), radius=30, fill=C_PANEL)
+            _draw_rounded_rect(draw, (px1, py1, px2, py2), radius=30, outline=color, width=4)
+
+            # Medal & Rank
+            _draw_text_centered_glow(draw, emoji, cx, py1 - 60, fn_huge, color, glow_color=glow)
+
+            # Player Name
+            name = p.first_name[:14].upper()
+            _draw_text_centered(draw, name, cx, py1 + 80, fn_hdr, C_WHITE)
+            draw.line([(cx - 100, py1 + 160), (cx + 100, py1 + 160)], fill=color, width=3)
+
+            # Score & Balls
+            score_t = f"{p.runs}  ({p.balls_faced}b)"
+            _draw_text_centered_glow(draw, score_t, cx, py1 + 200, fn_big, C_WIN, glow_color=(10, 100, 30))
+
+            # Strike Rate
+            sr = round((p.runs / max(p.balls_faced, 1)) * 100, 1)
+            sr_color = C_WIN if sr > 150 else C_GOLD if sr > 100 else C_GRAY
+            _draw_text_centered(draw, f"SR: {sr}", cx, py1 + 310, fn_med, sr_color)
+
+            # Boundaries (Only if space allows, mainly for 1st & 2nd place or tall cards)
+            if py2 - py1 > 400 and (p.boundaries > 0 or p.sixes > 0):
+                _draw_rounded_rect(draw, (cx - 160, py2 - 90, cx + 160, py2 - 30), radius=15, fill=(20, 26, 60))
+                bdy_t = f"4s: {p.boundaries}   •   6s: {p.sixes}"
+                _draw_text_centered(draw, bdy_t, cx, py2 - 75, fn_tiny, C_WHITE)
+
+        # ══════════════════════════════════════════════════════
+        # CONFETTI / PARTICLES (Around Winner)
+        # ══════════════════════════════════════════════════════
+        random.seed(total_runs_seed_or_whatever := sum(p.runs for p in top3)) # Consistent random
+        for _ in range(60):
+            ptx = random.randint(W//2 - 400, W//2 + 400)
+            pty = random.randint(200, 600)
+            sz = random.randint(3, 8)
+            pc = random.choice([themes[0][1], themes[1][1], C_WHITE, C_WIN])
+            draw.ellipse([(ptx, pty), (ptx+sz, pty+sz)], fill=pc)
+
+        # ══════════════════════════════════════════════════════
+        # WINNER BANNER
+        # ══════════════════════════════════════════════════════
+        if top3:
+            winner = top3[0]
+            ban_y = H - 160
+            _draw_rounded_rect(draw, (W//2 - 400, ban_y, W//2 + 400, ban_y + 80), radius=20, fill=themes[0][1])
+            _draw_text_centered(draw, f"🏆  CHAMPION:  {winner.first_name.upper()}  🏆", W//2, ban_y + 12, fn_med, (10, 10, 20))
+
+        # ══════════════════════════════════════════════════════
+        # CRICORA BRANDING FOOTER
+        # ══════════════════════════════════════════════════════
+        _draw_text_centered_glow(draw, "⚡ Cricoverse  |  Solo Battle", W//2, H - 60, fn_tiny, C_GRAY)
+
+        bio = BytesIO()
+        img.save(bio, "PNG", optimize=True)
+        bio.seek(0)
+        return bio
+        
+    except Exception as e:
+        logger.error(f"Solo top3 image error: {e}")
+        import traceback; logger.error(traceback.format_exc())
+        return None
+
+# ─────────────────────────────────────────────────────────────────
+#  TEAM END IMAGE V3  (wrapper using new summary image)
+# ─────────────────────────────────────────────────────────────────
+async def generate_team_end_image_v3(match, winner_name: str, context) -> Optional[BytesIO]:
+    """Generate final match summary image - uses worm graph as summary."""
+    try:
+        return generate_worm_graph(match)
+    except Exception as e:
+        logger.error(f"generate_team_end_image_v3 error: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────
+#  SOLO END IMAGE V2  (wrapper using solo top3 image)
+# ─────────────────────────────────────────────────────────────────
+async def generate_solo_end_image_v2(context, chat_id: int, match) -> None:
+    """Generate and send solo end top-3 image."""
+    try:
+        sorted_players = sorted(match.solo_players, key=lambda p: p.runs, reverse=True)
+        bio = generate_solo_top3_image(sorted_players)
+        if bio:
+            caption = (
+                f"⚔️ <b>SOLO BATTLE TOP BATSMEN</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            )
+            for i, p in enumerate(sorted_players[:3]):
+                medal = ["🥇", "🥈", "🥉"][i]
+                sr = round((p.runs / max(p.balls_faced, 1)) * 100, 1)
+                caption += f"{medal} <b>{p.first_name}</b>: {p.runs} ({p.balls_faced})  SR: {sr}\n"
+            if sorted_players:
+                caption += f"\n🏆 <b>Winner:</b> {sorted_players[0].first_name}"
+            await context.bot.send_photo(chat_id, photo=bio, caption=caption, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Solo end image v2 error: {e}")
+
+
+def _build_mid_match_caption(match) -> str:
+    """Build caption text for mid-match live score image."""
+    bat_team  = match.current_batting_team
+    bowl_team = match.current_bowling_team
+    if not bat_team or not bowl_team:
+        return "🔴 <b>LIVE</b>"
+    caption = (
+        f"🔴 <b>LIVE SCORE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏏 <b>{bat_team.name}:</b>  {bat_team.score}/{bat_team.wickets}  ({format_overs(bat_team.balls)} ov)\n"
+    )
+    if match.innings == 2 and match.target > 0:
+        needed = match.target - bat_team.score
+        bl = (match.total_overs * 6) - bat_team.balls
+        rrr = round(needed / max(bl / 6, 0.1), 2)
+        caption += f"🎯 Need <b>{needed}</b> off <b>{bl}b</b>  RRR: {rrr}\n"
+    # Current bowler
+    if bowl_team.current_bowler_idx is not None and bowl_team.current_bowler_idx < len(bowl_team.players):
+        bowler = bowl_team.players[bowl_team.current_bowler_idx]
+        caption += f"⚡ <b>Current Bowler:</b> {bowler.first_name}  {bowler.wickets}/{bowler.runs_conceded}  ({format_overs(bowler.balls_bowled)})\n"
+    # Current batsmen
+    striker = bat_team.players[bat_team.current_batsman_idx] if bat_team.current_batsman_idx is not None else None
+    nonstriker = bat_team.players[bat_team.current_non_striker_idx] if bat_team.current_non_striker_idx is not None else None
+    if striker:
+        sr_s = round((striker.runs / max(striker.balls_faced, 1)) * 100, 1)
+        caption += f"🏏 <b>{striker.first_name}:</b> {striker.runs} ({striker.balls_faced})  SR: {sr_s}\n"
+    if nonstriker:
+        sr_n = round((nonstriker.runs / max(nonstriker.balls_faced, 1)) * 100, 1)
+        caption += f"🔄 <b>{nonstriker.first_name}:</b> {nonstriker.runs} ({nonstriker.balls_faced})  SR: {sr_n}\n"
+    if match.current_partnership_runs > 0:
+        caption += f"🤝 <b>Partnership:</b> {match.current_partnership_runs} runs off {match.current_partnership_balls} balls"
+    return caption
+
+def _get_font(bold: bool, size: int):
+    """Load a font, fallback gracefully."""
+    bold_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    reg_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ]
+    paths = bold_paths if bold else reg_paths
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _clean_display_name(name: str, max_len: int = 20) -> str:
+    """
+    Clean a Telegram display name for image rendering.
+    Removes emojis, special symbols, designer/role tags, and limits length.
+    Handles names like '🎨 Designer | John' → 'John'
+    or '⚡ John ⚡' → 'John'
+    """
+    import unicodedata
+    import re
+    # Remove emoji characters using unicode category check
+    cleaned = ''.join(
+        ch for ch in name
+        if not (unicodedata.category(ch).startswith('So') or  # Symbol, other (many emoji)
+                unicodedata.category(ch).startswith('Sm') or  # Symbol, math
+                unicodedata.category(ch).startswith('Sk') or  # Symbol, modifier
+                ord(ch) > 0x1F000)  # Emoji range
+    )
+    # Remove common role/designer tag patterns like "Designer |", "| Owner"
+    cleaned = re.sub(r'[|/\\#@*_~`<>]', ' ', cleaned)
+    # Collapse multiple spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    # If nothing left, fall back to original truncated
+    if not cleaned:
+        cleaned = re.sub(r'\s+', ' ', name).strip()[:max_len]
+    return cleaned[:max_len]
+
+
+def _draw_text_centered(draw, text, cx, y, font, fill):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    w = bbox[2] - bbox[0]
+    draw.text((cx - w // 2, y), text, font=font, fill=fill)
+
+
+def _draw_gradient_rect(img_draw_tuple, x1, y1, x2, y2, color_top, color_bot):
+    """Vertical gradient fill on a rectangle."""
+    img, draw = img_draw_tuple
+    h = y2 - y1
+    if h <= 0:
+        return
+    for i in range(h):
+        t = i / h
+        r = int(color_top[0] + t * (color_bot[0] - color_top[0]))
+        g = int(color_top[1] + t * (color_bot[1] - color_top[1]))
+        b = int(color_top[2] + t * (color_bot[2] - color_top[2]))
+        draw.line([(x1, y1 + i), (x2, y1 + i)], fill=(r, g, b))
+
+
+# ─────────────────────────────────────────────────────────────────
+#  MOMENTUM IMAGE  (4K)
+# ─────────────────────────────────────────────────────────────────
+def _draw_rounded_rect(draw, xy, radius, fill=None, outline=None, width=1):
+    """Draw a rectangle with rounded corners."""
+    x1, y1, x2, y2 = xy
+    r = radius
+    if fill:
+        draw.rectangle([x1+r, y1, x2-r, y2], fill=fill)
+        draw.rectangle([x1, y1+r, x2, y2-r], fill=fill)
+        draw.ellipse([x1, y1, x1+2*r, y1+2*r], fill=fill)
+        draw.ellipse([x2-2*r, y1, x2, y1+2*r], fill=fill)
+        draw.ellipse([x1, y2-2*r, x1+2*r, y2], fill=fill)
+        draw.ellipse([x2-2*r, y2-2*r, x2, y2], fill=fill)
+    if outline:
+        draw.arc([x1, y1, x1+2*r, y1+2*r], 180, 270, fill=outline, width=width)
+        draw.arc([x2-2*r, y1, x2, y1+2*r], 270, 360, fill=outline, width=width)
+        draw.arc([x1, y2-2*r, x1+2*r, y2], 90, 180, fill=outline, width=width)
+        draw.arc([x2-2*r, y2-2*r, x2, y2], 0, 90, fill=outline, width=width)
+        draw.line([x1+r, y1, x2-r, y1], fill=outline, width=width)
+        draw.line([x1+r, y2, x2-r, y2], fill=outline, width=width)
+        draw.line([x1, y1+r, x1, y2-r], fill=outline, width=width)
+        draw.line([x2, y1+r, x2, y2-r], fill=outline, width=width)
+
+
+def _draw_rounded_rect_rgba(draw, xy, radius, fill=None, outline=None, width=1):
+    """Draw a rounded rect on an RGBA ImageDraw (supports alpha fill tuples)."""
+    _draw_rounded_rect(draw, xy, radius, fill=fill, outline=outline, width=width)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  OVER-BY-OVER BAR CHART  (replaces static MINI_SCORECARD_PHOTO)
+# ─────────────────────────────────────────────────────────────────
+from PIL import Image, ImageDraw, ImageFilter
+from io import BytesIO
+from typing import Optional
+
+def generate_over_bar_chart(match) -> Optional[BytesIO]:
+    """
+    🚀 GOD-LEVEL Over-by-Over Chart
+    Features: Glassmorphism, Rounded Neon Bars, and Depth-field lighting.
+    """
+    try:
+        W, H = 1400, 800
+        PAD_L, PAD_R, PAD_T, PAD_B = 100, 60, 110, 140
+        CHART_W = W - PAD_L - PAD_R
+        CHART_H = H - PAD_T - PAD_B
+
+        # --- Premium Palette ---
+        BG_DARK      = (6, 10, 28)        # Deep Space
+        BG_GRADIENT  = [(10, 15, 40), (6, 10, 28), (15, 10, 35)] # Top-Down-Bottom
+        C_BLUE       = (0, 195, 255)      # Neon Cyan
+        C_PINK       = (255, 46, 126)     # Cyber Pink
+        C_GOLD       = (255, 215, 0)      # Trophy Gold
+        C_WHITE      = (240, 245, 255)
+        C_GRID       = (30, 45, 85, 150)  # Semi-transparent grid
+        C_WICKET     = (255, 50, 50)      # High-vis Wicket Red
+
+        # Create base image with gradient
+        img = Image.new("RGBA", (W, H), BG_DARK)
+        _draw_multi_gradient_bg(img, BG_GRADIENT)
+        draw = ImageDraw.Draw(img)
+
+        # Fonts (assuming _get_font exists)
+        fn_title = _get_font(True, 58)
+        fn_bold  = _get_font(True, 42)
+        fn_med   = _get_font(True, 32)
+        fn_reg   = _get_font(False, 28)
+
+        # ── Data Preparation (ball-by-ball aware, includes in-progress over) ──
+        bat_team_bar = getattr(match, 'current_batting_team', None)
+        cur_over_runs = getattr(match, 'current_over_runs', 0)
+        cur_over_wkts = getattr(match, 'current_over_wickets', 0)
+
+        # Build full over lists including the current in-progress over
+        full_x_runs = list(match.team_x_over_runs)
+        full_y_runs = list(match.team_y_over_runs)
+        full_x_wkts = list(getattr(match, 'team_x_over_wickets', []))
+        full_y_wkts = list(getattr(match, 'team_y_over_wickets', []))
+
+        # Append current in-progress over for the batting team (ball-by-ball update)
+        x_is_live = False
+        y_is_live = False
+        if bat_team_bar is not None and cur_over_runs > 0:
+            if bat_team_bar == match.team_x:
+                full_x_runs = full_x_runs + [cur_over_runs]
+                full_x_wkts = full_x_wkts + [cur_over_wkts]
+                x_is_live = True
+            else:
+                full_y_runs = full_y_runs + [cur_over_runs]
+                full_y_wkts = full_y_wkts + [cur_over_wkts]
+                y_is_live = True
+
+        # Show last 5 overs (including in-progress)
+        x_runs = full_x_runs[-5:]
+        y_runs = full_y_runs[-5:]
+        x_wkts = full_x_wkts[-5:]
+        y_wkts = full_y_wkts[-5:]
+
+        # Determine which over index is live (for dotted/live indicator)
+        x_live_idx = len(x_runs) - 1 if x_is_live else -1
+        y_live_idx = len(y_runs) - 1 if y_is_live else -1
+
+        n = max(len(x_runs), len(y_runs), 1)
+        # Pad with 0s
+        while len(x_runs) < n: x_runs.insert(0, 0); x_wkts.insert(0, 0)
+        while len(y_runs) < n: y_runs.insert(0, 0); y_wkts.insert(0, 0)
+
+        # Compute over number offset for labels
+        x_over_offset = len(full_x_runs) - len(x_runs)
+        y_over_offset = len(full_y_runs) - len(y_runs)
+
+        max_runs = max(x_runs + y_runs + [10]) + 2
+        slot_w = CHART_W // n
+        bar_w = int(slot_w * 0.35)
+
+        # ── Draw Grid & Axes ────────────────────────────────────────
+        for j in range(6):
+            val = int(j * max_runs / 5)
+            gy = PAD_T + CHART_H - int(j * CHART_H / 5)
+            draw.line([(PAD_L, gy), (PAD_L + CHART_W, gy)], fill=C_GRID, width=2)
+            draw.text((PAD_L - 45, gy - 15), str(val), font=fn_reg, fill=(100, 120, 180))
+
+        # ── Draw Bars with FX ───────────────────────────────────────
+        for i in range(n):
+            center_x = PAD_L + i * slot_w + (slot_w // 2)
+
+            # Determine if this is live (in-progress) bar
+            bar_x_live = (i == x_live_idx)
+            bar_y_live = (i == y_live_idx)
+
+            # Team X (Blue)
+            if x_runs[i] > 0 or bar_x_live:
+                bx1, bx2 = center_x - bar_w - 5, center_x - 5
+                bar_color_x = (0, 230, 120) if bar_x_live else C_BLUE  # Green tint for live
+                _draw_neo_bar(draw, bx1, bx2, max(x_runs[i], 1), max_runs, CHART_H, PAD_T, bar_color_x, x_wkts[i] if i < len(x_wkts) else 0, fn_bold)
+
+            # Team Y (Pink)
+            if y_runs[i] > 0 or bar_y_live:
+                by1, by2 = center_x + 5, center_x + bar_w + 5
+                bar_color_y = (255, 200, 0) if bar_y_live else C_PINK  # Gold tint for live
+                _draw_neo_bar(draw, by1, by2, max(y_runs[i], 1), max_runs, CHART_H, PAD_T, bar_color_y, y_wkts[i] if i < len(y_wkts) else 0, fn_bold)
+
+            # Over Labels — use correct over number
+            # Use x offset unless x is empty, then y offset
+            if x_runs[i] > 0 or x_is_live:
+                ov_num = x_over_offset + i + 1
+            else:
+                ov_num = y_over_offset + i + 1
+            live_marker = " ●" if (bar_x_live or bar_y_live) else ""
+            _draw_text_centered_glow(draw, f"OVR {ov_num}{live_marker}", center_x, PAD_T + CHART_H + 25, fn_med, (255, 220, 60) if (bar_x_live or bar_y_live) else (160, 180, 220))
+
+        # ── Header & Info ───────────────────────────────────────────
+        title = f"{match.team_x.name} ⚔️ {match.team_y.name}".upper()
+        _draw_text_centered_glow(draw, title, W//2, 25, fn_title, C_GOLD, glow_color=(150, 120, 0))
+        
+        score_text = f"{match.team_x.score}/{match.team_x.wickets} vs {match.team_y.score}/{match.team_y.wickets}"
+        _draw_text_centered_glow(draw, score_text, W//2, 95, fn_reg, C_WHITE)
+
+        # ── Final Processing ────────────────────────────────────────
+        img = img.convert("RGB")
+        bio = BytesIO()
+        img.save(bio, "PNG", quality=95)
+        bio.seek(0)
+        return bio
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+def _draw_neo_bar(draw, x1, x2, runs, max_runs, chart_h, pad_t, color, wkts, font):
+    """Draws a rounded, glowing bar with wicket indicators."""
+    bh = max(int(runs / max_runs * chart_h), 10)
+    y2 = pad_t + chart_h
+    y1 = y2 - bh
+    
+    # 1. Soft Shadow
+    draw.rectangle([x1+4, y1+4, x2+4, y2], fill=(0, 0, 0, 80))
+    
+    # 2. Main Bar Gradient (Glass effect)
+    for i in range(bh):
+        ratio = i / bh
+        # Lighten the top, darken the bottom
+        current_color = tuple(int(c * (0.4 + 0.6 * (1 - ratio))) for c in color)
+        draw.line([(x1, y1 + i), (x2, y1 + i)], fill=current_color)
+    
+    # 3. Top Highlight Line
+    draw.line([(x1, y1), (x2, y1)], fill=(255, 255, 255, 200), width=3)
+    
+    # 4. Run Label
+    txt = str(runs)
+    tw = draw.textbbox((0, 0), txt, font=font)[2]
+    draw.text(((x1 + x2)//2 - tw//2, y1 - 50), txt, font=font, fill=(255, 255, 255))
+    
+    # 5. Wicket Glow (If any)
+    if wkts > 0:
+        rad = 18
+        cx, cy = (x1 + x2) // 2, y1 - 85
+        draw.ellipse([cx-rad, cy-rad, cx+rad, cy+rad], fill=(255, 50, 50))
+        draw.text((cx-8, cy-12), str(wkts), font=font, fill=(255, 255, 255))
+
+def _draw_glowing_text(draw, text, x, y, font, fill, glow_color=None, glow_radius=12):
+    """Draw text with a soft glow effect."""
+    if glow_color:
+        for dx in range(-glow_radius, glow_radius+1, 4):
+            for dy in range(-glow_radius, glow_radius+1, 4):
+                alpha = max(0, 1 - (abs(dx)+abs(dy))/(glow_radius*2))
+                gc = tuple(int(c * alpha * 0.6) for c in glow_color)
+                if any(c > 0 for c in gc):
+                    draw.text((x+dx, y+dy), text, font=font, fill=gc)
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def _draw_text_centered_glow(draw, text, cx, y, font, fill, glow_color=None):
+    """Centered text with optional glow."""
+    bbox = draw.textbbox((0, 0), text, font=font)
+    w = bbox[2] - bbox[0]
+    _draw_glowing_text(draw, text, cx - w//2, y, font, fill, glow_color, glow_radius=18)
+
+
+def _draw_multi_gradient_bg(img, colors):
+    """Draw a multi-stop vertical gradient background."""
+    draw = ImageDraw.Draw(img)
+    W, H = img.size
+    n = len(colors) - 1
+    seg_h = H // n
+    for si in range(n):
+        c1, c2 = colors[si], colors[si+1]
+        sy = si * seg_h
+        ey = (si+1) * seg_h if si < n-1 else H
+        for i in range(ey - sy):
+            t = i / max(ey - sy - 1, 1)
+            r = int(c1[0] + t*(c2[0]-c1[0]))
+            g = int(c1[1] + t*(c2[1]-c1[1]))
+            b = int(c1[2] + t*(c2[2]-c1[2]))
+            draw.line([(0, sy+i),(W, sy+i)], fill=(r,g,b))
+
+
+def generate_momentum_image(match) -> Optional[BytesIO]:
+    """
+    ⚡ GOD-TIER 4K Momentum Dashboard — Ultra Enhanced:
+    • Glassmorphism panel cards with rounded corners & glows
+    • Dual neon arc speedometers with gradient fills
+    • Win-probability iridescent semicircle gauge  
+    • Smooth Last-6-balls animated-style hex tiles
+    • Animated neon grid background
+    • Cricora branding footer with particle dots
+    """
+    try:
+        import math
+        from io import BytesIO
+        from PIL import Image, ImageDraw
+
+        W, H = _IMG4K_W, _IMG4K_H
+
+        # ══════════════════════════════════════════════════════
+        # GOD-TIER BACKGROUND — deep space aurora gradient
+        # ══════════════════════════════════════════════════════
+        img = Image.new('RGB', (W, H), (4, 5, 14))
+        _draw_multi_gradient_bg(img, [
+            (4,   5,  14),
+            (8,  12,  32),
+            (6,   9,  26),
+            (10, 14,  38),
+            (5,   8,  20),
+        ])
+        draw = ImageDraw.Draw(img)
+
+        # Subtle neon grid lines
+        for gx in range(0, W, 240):
+            draw.line([(gx, 0), (gx, H)], fill=(20, 30, 60), width=1)
+        for gy in range(0, H, 240):
+            draw.line([(0, gy), (W, gy)], fill=(20, 30, 60), width=1)
+
+        # Diagonal accent streaks
+        for sx in range(-H, W, 400):
+            draw.line([(sx, 0), (sx+H, H)], fill=(25, 35, 80), width=2)
+
+        # ── Enhanced Palette for Clear Visibility ──
+        C_BG      = (4,   5,  14)
+        C_BORDER  = (45, 60, 120)
+        C_BORDER2 = (80, 100, 200)
+        C_GOLD    = (255, 215, 70)   # Brighter Gold
+        C_WHITE   = (245, 250, 255)  # Crisper White
+        C_GRAY    = (160, 175, 210)
+        C_X       = (70, 185, 255)   # Team X – Electric Blue
+        C_X2      = (140, 220, 255)
+        C_Y       = (255, 85, 130)   # Team Y – Hot Pink
+        C_Y2      = (255, 150, 185)
+        C_GREEN   = (55, 240, 130)
+        C_RED     = (240, 70, 80)
+        C_CYAN    = (0, 230, 230)
+        C_PURPLE  = (190, 90, 255)
+
+        tx_name = match.team_x.name[:16]
+        ty_name = match.team_y.name[:16]
+
+        # ══════════════════════════════════════════════════════
+        # PREMIUM HEADER — glassmorphism card with glow border
+        # ══════════════════════════════════════════════════════
+        _draw_rounded_rect(draw, (40, 18, W-40, 200), radius=30, fill=(18, 24, 58))
+        _draw_rounded_rect(draw, (40, 18, W-40, 200), radius=30, outline=C_BORDER2, width=4)
+        
+        # Gold accent line under header
+        for lx in range(40, W-40):
+            t = (lx - 40) / (W - 80)
+            r = int(C_GOLD[0]*t + C_PURPLE[0]*(1-t)) if t > 0.5 else int(C_PURPLE[0]*t*2 + C_X[0]*(1-t*2))
+            g = int(C_GOLD[1]*t + C_PURPLE[1]*(1-t)) if t > 0.5 else int(C_PURPLE[1]*t*2 + C_X[1]*(1-t*2))
+            b = int(C_GOLD[2]*t + C_PURPLE[2]*(1-t)) if t > 0.5 else int(C_PURPLE[2]*t*2 + C_X[2]*(1-t*2))
+            draw.point((lx, 198), fill=(r, g, b))
+        draw.line([(40, 198), (W-40, 198)], fill=C_GOLD, width=3)
+
+        f_hdr  = _get_font(True,  128)
+        f_sub  = _get_font(False, 76)
+        f_med  = _get_font(True,  92)
+        f_sml  = _get_font(False, 66)
+        f_xs   = _get_font(False, 54)
+        f_num  = _get_font(True,  148)
+
+        _draw_text_centered_glow(draw, "⚡  MOMENTUM  DASHBOARD", W//2, 28, f_hdr, C_GOLD, glow_color=(255, 160, 0))
+        _draw_text_centered_glow(draw, f"{tx_name}  ⚔  {ty_name}", W//2, 110, f_sub, C_GRAY)
+
+        # ═══════════════════════════════
+        # 1.  NEON ARC SPEEDOMETERS (Shifted up to center the layout)
+        # ═══════════════════════════════
+        def calc_momentum_score(team_name, ball_log):
+            score = 0
+            for b in ball_log[-24:]:
+                bt = b.get('batting_team', '')
+                r  = b.get('runs', 0)
+                w  = b.get('wicket', False) or b.get('is_wicket', False)
+                wd = b.get('wide', False)
+                nb = b.get('noball', False)
+                dot = (r == 0 and not wd and not nb)
+                if bt == team_name:
+                    score += r
+                    if r == 6: score += 8
+                    elif r == 4: score += 4
+                    if dot: score -= 2
+                    if w: score -= 20
+                else:
+                    if w: score += 15
+                    if dot: score += 3
+                    if r == 6: score -= 6
+            return score
+
+        raw_x = calc_momentum_score(match.team_x.name, match.ball_by_ball_log)
+        raw_y = calc_momentum_score(match.team_y.name, match.ball_by_ball_log)
+        mx = max(abs(raw_x), abs(raw_y), 1)
+        pct_x = max(0, min(100, 50 + raw_x / mx * 50))
+        pct_y = max(0, min(100, 50 + raw_y / mx * 50))
+
+        def draw_speedometer(cx, cy, radius, pct, team_color, team_color2, team_name, raw_score):
+            sa, ea = 200, 340  
+            span = ea - sa     
+
+            # Glass card behind speedometer
+            card_pad = radius + 180
+            _draw_rounded_rect(draw,
+                (cx - card_pad, cy - card_pad, cx + card_pad, cy + card_pad // 2 + 220),
+                radius=50, fill=(12, 16, 38))
+            _draw_rounded_rect(draw,
+                (cx - card_pad, cy - card_pad, cx + card_pad, cy + card_pad // 2 + 220),
+                radius=50, outline=team_color, width=4)
+
+            # Track arc (dark)
+            draw.arc([(cx-radius, cy-radius), (cx+radius, cy+radius)], sa, ea, fill=(28, 35, 80), width=52)
+
+            # Filled neon arc
+            fill_end = sa + span * pct / 100
+            segs = max(2, int(span * pct / 100 // 5))
+            if segs > 1:
+                seg_span = (fill_end - sa) / segs
+                for si in range(segs):
+                    t = si / max(segs-1, 1)
+                    rc = int(team_color[0] + t*(team_color2[0]-team_color[0]))
+                    gc = int(team_color[1] + t*(team_color2[1]-team_color[1]))
+                    bc = int(team_color[2] + t*(team_color2[2]-team_color[2]))
+                    seg_s = sa + si * seg_span
+                    seg_e = sa + (si+1) * seg_span + 1
+                    draw.arc([(cx-radius, cy-radius), (cx+radius, cy+radius)],
+                             seg_s, seg_e, fill=(rc, gc, bc), width=58)
+            else:
+                draw.arc([(cx-radius, cy-radius), (cx+radius, cy+radius)],
+                         sa, fill_end, fill=team_color, width=58)
+
+            # Needle with glow
+            needle_angle = math.radians(sa + span * pct / 100)
+            needle_len = radius - 70
+            nx = cx + int(needle_len * math.cos(needle_angle))
+            ny = cy + int(needle_len * math.sin(needle_angle))
+            
+            draw.line([(cx, cy+4), (nx+4, ny+4)], fill=(0,0,0), width=12) # Shadow
+            draw.line([(cx, cy), (nx, ny)], fill=C_WHITE, width=14)       # Needle
+            draw.line([(cx, cy), (nx, ny)], fill=team_color2, width=4)    # Glow
+            
+            draw.ellipse([(cx-28, cy-28), (cx+28, cy+28)], fill=C_WHITE)
+            draw.ellipse([(cx-16, cy-16), (cx+16, cy+16)], fill=team_color)
+
+            # Tick marks
+            for tick_p in [0, 20, 40, 60, 80, 100]:
+                ta = math.radians(sa + span * tick_p / 100)
+                is_major = tick_p % 40 == 0
+                t_in  = radius + (15 if is_major else 25)
+                t_out = radius + (75 if is_major else 55)
+                tx1 = cx + int(t_in  * math.cos(ta))
+                ty1 = cy + int(t_in  * math.sin(ta))
+                tx2 = cx + int(t_out * math.cos(ta))
+                ty2 = cy + int(t_out * math.sin(ta))
+                draw.line([(tx1, ty1), (tx2, ty2)], fill=C_BORDER2 if is_major else C_BORDER, width=8 if is_major else 4)
+
+            # Labels
+            pct_color = C_GREEN if pct < 40 else C_GOLD if pct < 70 else C_RED
+            _draw_text_centered_glow(draw, f"{pct:.0f}", cx, cy - 100, f_num, pct_color, glow_color=pct_color)
+            _draw_text_centered(draw, team_name, cx, cy + 60, f_med, team_color)
+            _draw_text_centered(draw, "MOMENTUM SCORE", cx, cy - 220, f_xs, C_GRAY)
+
+            # Score badge
+            badge_txt = f"+{raw_score}" if raw_score >= 0 else str(raw_score)
+            _draw_rounded_rect(draw, (cx-120, cy+160, cx+120, cy+230), radius=20, fill=team_color)
+            _draw_text_centered(draw, badge_txt, cx, cy + 168, f_sml, (10, 10, 20))
+
+        R = 510
+        # ADJUSTED Y-COORDINATES (moved from 1050 to 900)
+        draw_speedometer(720,  900, R, pct_x, C_X,  C_X2,  tx_name, raw_x)
+        draw_speedometer(3120, 900, R, pct_y, C_Y,  C_Y2,  ty_name, raw_y)
+
+        # ═══════════════════════════════
+        # 2.  WIN PROBABILITY GAUGE
+        # ═══════════════════════════════
+        def win_prob(team, opp):
+            if match.innings == 1:
+                rr_t = team.score / max(team.balls / 6, 0.1)
+                rr_o = opp.score / max(opp.balls / 6, 0.1) if opp.balls > 0 else rr_t
+                base = 50 + (rr_t - rr_o) * 5
+                wkt_pen = team.wickets * 2
+                return max(5, min(95, base - wkt_pen))
+            else:
+                needed = max(0, match.target - team.score)
+                bl = (match.total_overs * 6) - (opp.balls)
+                if bl <= 0:
+                    return 95 if team.score >= match.target else 5
+                rrr = needed / bl * 6
+                crr = team.score / max(team.balls / 6, 0.1)
+                base = 50 + (crr - rrr) * 6
+                wkt_pen = team.wickets * 3
+                return max(5, min(95, base - wkt_pen))
+
+        bat_team  = match.current_batting_team  or match.team_x
+        bowl_team = match.current_bowling_team or match.team_y
+        wp_bat  = win_prob(bat_team, bowl_team)
+        wp_bowl = 100 - wp_bat
+
+        # ADJUSTED Y-COORDINATES (moved from 960 to 900)
+        gcx, gcy = W // 2, 900
+        gr = 500
+
+        # Glass card for gauge
+        _draw_rounded_rect(draw, (gcx-gr-120, gcy-gr-80, gcx+gr+120, gcy+220), radius=50, fill=(12, 16, 38))
+        _draw_rounded_rect(draw, (gcx-gr-120, gcy-gr-80, gcx+gr+120, gcy+220), radius=50, outline=C_BORDER, width=3)
+
+        # Track
+        draw.arc([(gcx-gr, gcy-gr), (gcx+gr, gcy+gr)], 180, 360, fill=(28, 35, 80), width=68)
+
+        # X team arc (electric blue)
+        x_degrees = int(180 * wp_bat / 100)
+        for seg in range(x_degrees):
+            t = seg / max(x_degrees, 1)
+            rc = int(C_X[0] + t*(C_X2[0]-C_X[0]))
+            gc2 = int(C_X[1] + t*(C_X2[1]-C_X[1]))
+            bc = int(C_X[2] + t*(C_X2[2]-C_X[2]))
+            draw.arc([(gcx-gr, gcy-gr), (gcx+gr, gcy+gr)], 180+seg, 181+seg, fill=(rc, gc2, bc), width=75)
+
+        # Y team arc (hot pink)
+        y_start = 180 + x_degrees
+        for seg in range(180 - x_degrees):
+            t = seg / max(180 - x_degrees, 1)
+            rc = int(C_Y[0] + t*(C_Y2[0]-C_Y[0]))
+            gc2 = int(C_Y[1] + t*(C_Y2[1]-C_Y[1]))
+            bc = int(C_Y[2] + t*(C_Y2[2]-C_Y[2]))
+            draw.arc([(gcx-gr, gcy-gr), (gcx+gr, gcy+gr)], y_start+seg, y_start+seg+1, fill=(rc, gc2, bc), width=75)
+
+        draw.ellipse([(gcx-20, gcy-20), (gcx+20, gcy+20)], fill=C_WHITE)
+
+        # Labels
+        _draw_text_centered_glow(draw, "WIN PROBABILITY", gcx, gcy-gr-60, f_med, C_GOLD, glow_color=(180,120,0))
+        _draw_text_centered(draw, f"{bat_team.name[:12]}", gcx-420, gcy-110, f_med, C_X)
+        _draw_text_centered_glow(draw, f"{wp_bat:.0f}%", gcx-420, gcy-30, f_num, C_X, glow_color=C_X)
+        _draw_text_centered(draw, f"{bowl_team.name[:12]}", gcx+420, gcy-110, f_med, C_Y)
+        _draw_text_centered_glow(draw, f"{wp_bowl:.0f}%", gcx+420, gcy-30, f_num, C_Y, glow_color=C_Y)
+        draw.line([(gcx-gr-100, gcy), (gcx+gr+100, gcy)], fill=C_BORDER2, width=5)
+
+        # ═══════════════════════════════
+        # 3.  LAST 6 BALLS (Shifted up neatly)
+        # ═══════════════════════════════
+        # ADJUSTED Y-COORDINATES (moved from 1950 to 1550)
+        row_y = 1550
+        _draw_rounded_rect(draw, (0, row_y, W, row_y+260), radius=0, fill=(10, 14, 32))
+        draw.line([(0, row_y), (W, row_y)], fill=C_BORDER2, width=4)
+
+        l6 = match.ball_by_ball_log[-6:] if len(match.ball_by_ball_log) >= 6 else match.ball_by_ball_log
+        tile_r = 90
+        tile_gap = 240
+        start_cx = 280
+        _draw_text_centered(draw, "LAST 6 BALLS", start_cx + (len(l6)-1)*tile_gap//2 + 80, row_y+15, f_xs, C_GRAY)
+
+        for idx, b in enumerate(l6):
+            r  = b.get('runs', 0)
+            w  = b.get('wicket', False) or b.get('is_wicket', False)
+            wd = b.get('wide', False)
+            nb = b.get('noball', False)
+            
+            if w:    bc, lbl, glow = (200,40,40),   'W',   (255, 60, 60)
+            elif wd: bc, lbl, glow = (200,170,0),   'Wd',  (255, 220, 0)
+            elif nb: bc, lbl, glow = (180,100,0),   'Nb',  (230, 140, 0)
+            elif r==6: bc, lbl, glow = (130,0,240), '6',   (180, 80, 255)
+            elif r==4: bc, lbl, glow = (0,120,240), '4',   (70, 185, 255)
+            elif r==0: bc, lbl, glow = (25,30,65),  '·',   (40, 50, 100)
+            else:    bc, lbl, glow = (30,160,70),   str(r),(50, 220, 110)
+
+            bx = start_cx + idx * tile_gap
+            by = row_y + 140
+
+            # Glow circle
+            for gr2 in range(40, 0, -10):
+                ga = gr2 / 40 * 0.4
+                gc3 = tuple(max(0, min(255, int(glow[i]*ga))) for i in range(3))
+                if any(c > 0 for c in gc3):
+                    draw.ellipse([(bx-tile_r-gr2, by-tile_r-gr2), (bx+tile_r+gr2, by+tile_r+gr2)], fill=gc3)
+
+            # Tile background & highlight
+            draw.ellipse([(bx-tile_r, by-tile_r), (bx+tile_r, by+tile_r)], fill=bc)
+            draw.ellipse([(bx-tile_r+10, by-tile_r+10), (bx+tile_r-10, by-tile_r+20)],
+                         fill=tuple(min(255, c+40) for c in bc))
+            
+            # Label
+            bbox = draw.textbbox((0,0), lbl, font=f_med)
+            lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text((bx - lw//2, by - lh//2 - 5), lbl, font=f_med, fill=C_WHITE)
+
+        # Current score stat strip
+        bat = match.current_batting_team or match.team_x
+        bwl = match.current_bowling_team or match.team_y
+        ovs = format_overs(bat.balls) if bat else "—"
+        rr  = round(bat.score / max(bat.balls / 6, 0.1), 2) if bat.balls > 0 else 0.0
+        
+        stats_txt = f"SCORE  {bat.score}/{bat.wickets}  ({ovs} ov)    RR {rr}"
+        if match.innings == 2 and match.target > 0:
+            needed = match.target - bat.score
+            bl = (match.total_overs * 6) - bwl.balls
+            rrr = round(needed/bl*6, 2) if bl > 0 else 0
+            stats_txt += f"    NEED  {needed}  OFF  {bl}  (RRR {rrr})"
+            
+        _draw_text_centered_glow(draw, stats_txt, W // 2 + 650, row_y + 120, f_med, C_WHITE)
+
+        # ═══════════════════════════════
+        # 4.  PREMIUM FOOTER with Branding
+        # ═══════════════════════════════
+        # ADJUSTED Y-COORDINATES (moved from 2220 to 1950)
+        footer_y = 1950
+        for fi in range(60):
+            t = fi / 60
+            draw.line([(0, footer_y+fi), (W, footer_y+fi)], fill=(int(8+t*4), int(10+t*4), int(20+t*8)))
+        draw.line([(0, footer_y), (W, footer_y)], fill=C_GOLD, width=3)
+
+        # Particle dots decoration
+        import random as _rnd
+        _rnd.seed(42)
+        for _ in range(80):
+            px2 = _rnd.randint(0, W)
+            py2 = _rnd.randint(footer_y+5, footer_y+55)
+            pr  = _rnd.randint(2, 6)
+            pc  = _rnd.choice([C_GOLD, C_X, C_Y, C_CYAN, C_PURPLE])
+            draw.ellipse([(px2-pr, py2-pr), (px2+pr, py2+pr)], fill=pc)
+
+        # Updated Branding text
+        _draw_text_centered_glow(draw, f"⚡ Cricora  |  {match.group_name[:30]}  |  Ultra Analytics",
+                                 W//2, footer_y + 5, f_xs, C_GRAY)
+
+        # Optionally crop the image so you don't have empty space at the very bottom
+        img = img.crop((0, 0, W, footer_y + 60))
+
+        bio = BytesIO()
+        img.save(bio, 'PNG', optimize=False)
+        bio.seek(0)
+        return bio
+
+    except Exception as e:
+        logger.error(f"generate_momentum_image error: {e}")
+        import traceback; logger.error(traceback.format_exc())
+        return None
+
+# ─────────────────────────────────────────────────────────────────
+#  STRIKE MAP  (4K wagon-wheel style)
+# ─────────────────────────────────────────────────────────────────
+def generate_strikemap_image(match) -> Optional[BytesIO]:
+    """
+    🗺️ GOD-TIER 4K Wagon-Wheel Strike Map — Ultra Enhanced:
+    • Lush premium cricket field with realistic texture rings & thick boundary rope
+    • Intense neon glowing spoke lines per ball with golden-angle spread
+    • Premium Glassmorphism stats panel with perfectly aligned typography
+    • Modern rounded legend badges with immersive glows
+    • Crease markings, pitch highlight, compass rose
+    • Cricora premium footer
+    """
+    try:
+        import math, hashlib
+        from io import BytesIO
+        from PIL import Image, ImageDraw
+
+        W, H = _IMG4K_W, _IMG4K_H
+
+        # ── Premium deep-space background ──
+        img = Image.new('RGB', (W, H), (4, 5, 14))
+        _draw_multi_gradient_bg(img, [
+            (4,   6,  16),
+            (8,  12,  32),
+            (5,   8,  22),
+            (10, 15,  40),
+        ])
+        draw = ImageDraw.Draw(img)
+
+        # Subtle dynamic grid
+        for gx in range(0, W, 240):
+            draw.line([(gx, 0), (gx, H)], fill=(18, 26, 55), width=1)
+        for gy in range(0, H, 240):
+            draw.line([(0, gy), (W, gy)], fill=(18, 26, 55), width=1)
+
+        # ── Ultimate Color Palette ──
+        C_BG      = (4,   5,  14)
+        C_PANEL   = (12, 16, 38)
+        C_GLASS   = (18, 24, 55)
+        C_BORDER  = (45, 60, 120)
+        C_BORDER2 = (80, 120, 220) # Brighter border accent
+        C_GOLD    = (255, 215, 70)
+        C_GOLD2   = (255, 175, 30)
+        C_WHITE   = (245, 250, 255)
+        C_GRAY    = (160, 175, 210)
+        C_GREEN   = (55, 240, 120)
+        C_FIELD   = (10, 42, 15)   # Richer field green
+        C_FIELD2  = (16, 58, 22)
+        C_PITCH   = (158, 128, 82)
+        C_PITCH2  = (178, 148, 100)
+        
+        # Action Colors (Neon Enhanced)
+        C_DOT     = (70,  75, 115)
+        C_4       = (30, 160, 255)
+        C_4g      = (100, 200, 255)
+        C_6       = (180, 70, 255)
+        C_6g      = (220, 140, 255)
+        C_WKT     = (240, 50, 50)
+        C_WKTg    = (255, 110, 110)
+        C_SINGLE  = (40, 220, 100)
+        C_2_3     = (210, 210, 50)
+
+        f_hdr  = _get_font(True,  128)
+        f_sub  = _get_font(False, 76)
+        f_med  = _get_font(True,  92)
+        f_sml  = _get_font(False, 66)
+        f_xs   = _get_font(False, 54)
+        f_num  = _get_font(True,  168)
+        f_tiny = _get_font(False, 44)
+
+        # ══════════════════════════════════════════════════════
+        # PREMIUM HEADER 
+        # ══════════════════════════════════════════════════════
+        _draw_rounded_rect(draw, (40, 18, W-40, 200), radius=35, fill=(16, 22, 52))
+        _draw_rounded_rect(draw, (40, 18, W-40, 200), radius=35, outline=C_BORDER2, width=4)
+        draw.line([(40, 198), (W-40, 198)], fill=C_GOLD, width=4)
+
+        bat_team  = match.current_batting_team  or match.batting_first or match.team_x
+        bowl_team = match.current_bowling_team or match.team_y
+        
+        _draw_text_centered_glow(draw, "🏏  STRIKE  MAP", W//2, 22, f_hdr, C_GOLD, glow_color=(180, 120, 0))
+        _draw_text_centered(draw,
+            f"{bat_team.name}  batting  ·  {format_overs(bat_team.balls)} overs  ·  {bat_team.score}/{bat_team.wickets}",
+            W//2, 110, f_sub, C_GRAY)
+
+        # ══════════════════════════════════════════════════════
+        # PREMIUM WAGON WHEEL (Left 60%)
+        # ══════════════════════════════════════════════════════
+        ww_cx = int(W * 0.37)
+        ww_cy = H // 2 + 50
+        field_r   = 900          # outer boundary
+        inner_r   = 270          # 30-yard circle
+        pitch_hw  = 48
+
+        # Outer boundary intense glow
+        for gr_glow in range(50, 0, -10):
+            ga = gr_glow / 50 * 0.35
+            gc = (int(30*ga), int(100*ga), int(40*ga))
+            draw.ellipse([(ww_cx-field_r-gr_glow, ww_cy-field_r-gr_glow),
+                          (ww_cx+field_r+gr_glow, ww_cy+field_r+gr_glow)],
+                         outline=gc, width=4)
+
+        # Field — realistic alternating stripe rings
+        for ring_r in range(field_r, 0, -60):
+            ring_idx = (field_r - ring_r) // 60
+            fc = C_FIELD if ring_idx % 2 == 0 else C_FIELD2
+            draw.ellipse([(ww_cx-ring_r, ww_cy-ring_r), (ww_cx+ring_r, ww_cy+ring_r)], fill=fc)
+
+        # Boundary rope (Thick and 3D effect)
+        draw.ellipse([(ww_cx-field_r, ww_cy-field_r), (ww_cx+field_r, ww_cy+field_r)], outline=(240, 240, 240), width=12)
+        draw.ellipse([(ww_cx-field_r+8, ww_cy-field_r+8), (ww_cx+field_r-8, ww_cy+field_r-8)], outline=(160, 160, 160), width=4)
+
+        # 30-yard circle
+        draw.ellipse([(ww_cx-inner_r, ww_cy-inner_r), (ww_cx+inner_r, ww_cy+inner_r)], outline=(220, 220, 220), width=6)
+        draw.ellipse([(ww_cx-inner_r+6, ww_cy-inner_r+6), (ww_cx+inner_r-6, ww_cy+inner_r-6)], outline=(120, 150, 120), width=3)
+
+        # Pitch strip with texture
+        draw.rectangle([(ww_cx-pitch_hw, ww_cy-inner_r+40), (ww_cx+pitch_hw, ww_cy+inner_r-40)], fill=C_PITCH)
+        for pi in range(ww_cy-inner_r+40, ww_cy+inner_r-40, 30):
+            draw.line([(ww_cx-pitch_hw, pi), (ww_cx+pitch_hw, pi)], fill=C_PITCH2, width=2)
+
+        # Crease lines (Crisper)
+        draw.line([(ww_cx-pitch_hw-25, ww_cy-inner_r+90), (ww_cx+pitch_hw+25, ww_cy-inner_r+90)], fill=C_WHITE, width=10)
+        draw.line([(ww_cx-pitch_hw-25, ww_cy+inner_r-90), (ww_cx+pitch_hw+25, ww_cy+inner_r-90)], fill=C_WHITE, width=10)
+        draw.line([(ww_cx-pitch_hw-10, ww_cy-inner_r+120), (ww_cx+pitch_hw+10, ww_cy-inner_r+120)], fill=(210, 210, 210), width=6)
+
+        # ── Ultimate Neon Spokes ──
+        balls = match.ball_by_ball_log or []
+        for idx, b in enumerate(balls):
+            r_val = b.get('runs', 0)
+            w     = b.get('wicket', False) or b.get('is_wicket', False)
+            wd    = b.get('wide', False)
+            nb    = b.get('noball', False)
+
+            if w:
+                color, glow_c, line_w, spoke_r = C_WKT, C_WKTg, 18, inner_r * 0.82
+            elif r_val == 6:
+                color, glow_c, line_w, spoke_r = C_6, C_6g, 22, field_r * 0.98
+            elif r_val == 4:
+                color, glow_c, line_w, spoke_r = C_4, C_4g, 20, field_r * 0.88
+            elif r_val in (2, 3):
+                color, glow_c, line_w, spoke_r = C_2_3, (240,240,100), 14, field_r * 0.58
+            elif r_val == 1:
+                color, glow_c, line_w, spoke_r = C_SINGLE, (100,255,140), 10, field_r * 0.44
+            else:
+                color, glow_c, line_w, spoke_r = C_DOT, (90, 100, 160), 8, inner_r * 0.55
+
+            seed = idx * 37 + r_val * 13 + (7 if w else 0)
+            angle_deg = (seed * 137.5) % 360
+            angle_rad = math.radians(angle_deg - 90)
+
+            ex = ww_cx + int(spoke_r * math.cos(angle_rad))
+            ey = ww_cy + int(spoke_r * math.sin(angle_rad))
+
+            # Layered Neon Glow Effect
+            for gw in range(8, 0, -2):
+                ga = gw / 8 * 0.4
+                gc2 = tuple(max(0, min(255, int(glow_c[i]*ga))) for i in range(3))
+                if any(c > 0 for c in gc2):
+                    draw.line([(ww_cx, ww_cy), (ex, ey)], fill=gc2, width=line_w + gw*3)
+            # Bright Core
+            draw.line([(ww_cx, ww_cy), (ex, ey)], fill=color, width=line_w)
+
+        # Batsman dot at centre (gold star effect)
+        draw.ellipse([(ww_cx-30, ww_cy-30), (ww_cx+30, ww_cy+30)], fill=C_GOLD)
+        draw.ellipse([(ww_cx-16, ww_cy-16), (ww_cx+16, ww_cy+16)], fill=(255, 255, 220))
+
+        # Compass rose labels with glows
+        for label, angle, color in [("N", -90, C_GRAY), ("E", 0, C_GRAY), ("S", 90, C_GRAY), ("W", 180, C_GRAY)]:
+            ax = ww_cx + int((field_r+80) * math.cos(math.radians(angle)))
+            ay = ww_cy + int((field_r+80) * math.sin(math.radians(angle)))
+            _draw_text_centered(draw, label, ax, ay-32, f_xs, color)
+
+        # ══════════════════════════════════════════════════════
+        # PREMIUM GLASSMORPHISM STATS PANEL (Right 38%)
+        # ══════════════════════════════════════════════════════
+        px1 = int(W * 0.66)
+        px2 = W - 80
+        py1 = 220
+        py2 = H - 240 # Adjusted for legend space
+
+        # Panel Background & Border
+        _draw_rounded_rect(draw, (px1-30, py1-30, px2+30, py2+30), radius=50, fill=(10, 14, 35))
+        _draw_rounded_rect(draw, (px1-30, py1-30, px2+30, py2+30), radius=50, outline=C_BORDER, width=4)
+        _draw_rounded_rect(draw, (px1-30, py1-30, px2+30, py1+140), radius=50, fill=(20, 28, 62)) # Header area
+        
+        pcx = (px1 + px2) // 2
+        _draw_text_centered_glow(draw, "MATCH STATISTICS", pcx, py1-10, f_med, C_GOLD, glow_color=(140, 90, 0))
+
+        # Stats Calculation
+        total_balls = len(balls)
+        sixes       = sum(1 for b in balls if b.get('runs',0) == 6)
+        fours       = sum(1 for b in balls if b.get('runs',0) == 4)
+        dots        = sum(1 for b in balls if b.get('runs',0)==0 and not b.get('wide') and not b.get('noball'))
+        wickets     = sum(1 for b in balls if b.get('wicket') or b.get('is_wicket'))
+        singles     = sum(1 for b in balls if b.get('runs',0) == 1)
+        twos_threes = sum(1 for b in balls if b.get('runs',0) in (2,3))
+        
+        boundaries_pct = round((fours + sixes) / max(total_balls, 1) * 100, 1)
+        dot_pct        = round(dots / max(total_balls, 1) * 100, 1)
+
+        striker = bat_team.players[bat_team.current_batsman_idx] if bat_team.current_batsman_idx is not None else None
+        non_striker = bat_team.players[bat_team.current_non_striker_idx] if bat_team.current_non_striker_idx is not None else None
+
+        rows = [
+            ("TEAM SCORE",   f"{bat_team.score}/{bat_team.wickets}", C_WHITE),
+            ("OVERS",        f"{format_overs(bat_team.balls)} / {match.total_overs}", C_WHITE),
+            ("RUN RATE",     f"{bat_team.score/max(bat_team.balls/6,0.1):.2f}", C_GREEN),
+            (None, None, None),
+            ("TOTAL BALLS",  str(total_balls), C_WHITE),
+            ("SIXES  🚀",    str(sixes),   C_6),
+            ("FOURS  🔥",    str(fours),   C_4),
+            ("SINGLES",      str(singles), C_SINGLE),
+            ("2s & 3s",      str(twos_threes), C_2_3),
+            ("DOTS  ⚫",      f"{dots}  ({dot_pct}%)", C_GRAY),
+            ("WICKETS  ❌",  str(wickets), C_WKT),
+            (None, None, None),
+            ("BOUNDARY %",   f"{boundaries_pct}%", C_GOLD),
+        ]
+        
+        if match.innings == 2 and match.target > 0:
+            needed2 = match.target - bat_team.score
+            bl_left = match.total_overs * 6 - bowl_team.balls
+            rrr = round(needed2 / max(bl_left, 1) * 6, 2)
+            rows += [
+                (None, None, None),
+                ("TARGET",    str(match.target), C_GOLD),
+                ("NEEDED",    f"{needed2} off {bl_left}", C_WHITE),
+                ("REQ. RR",   str(rrr), C_WKT if rrr > 12 else C_GOLD if rrr > 8 else C_GREEN),
+            ]
+
+        row_h = 92
+        cur_y = py1 + 155
+        for label, val, col in rows:
+            if label is None:
+                draw.line([(px1+10, cur_y+15), (px2-10, cur_y+15)], fill=C_BORDER, width=2)
+                cur_y += 45
+                continue
+            draw.text((px1+35, cur_y), label, font=f_sml, fill=C_GRAY)
+            bbox = draw.textbbox((0, 0), val, font=f_med)
+            vw = bbox[2] - bbox[0]
+            draw.text((px2-vw-25, cur_y-8), val, font=f_med, fill=col)
+            cur_y += row_h
+
+        if striker:
+            sy = cur_y + 20
+            draw.line([(px1+10, sy), (px2-10, sy)], fill=C_BORDER, width=2)
+            sy += 40
+            _draw_text_centered(draw, "AT THE CREASE", pcx, sy, f_xs, C_GRAY)
+            sy += 75
+            sr_sr = f"{striker.get_strike_rate():.0f}"
+            draw.text((px1+35, sy),    f"★ {striker.first_name[:14]}", font=f_sml, fill=C_WHITE)
+            draw.text((px1+35, sy+75), f"   {striker.runs} ({striker.balls_faced}b)  SR {sr_sr}", font=f_xs, fill=C_GREEN)
+            if non_striker:
+                draw.text((px1+35, sy+155), f"  {non_striker.first_name[:14]}", font=f_sml, fill=C_GRAY)
+                draw.text((px1+35, sy+230), f"   {non_striker.runs} ({non_striker.balls_faced}b)", font=f_xs, fill=C_GRAY)
+
+        # ══════════════════════════════════════════════════════
+        # MODERN GLOW LEGEND ROW (UI Button Style)
+        # ══════════════════════════════════════════════════════
+        legend_y = H - 195
+        draw.line([(0, legend_y), (W, legend_y)], fill=C_BORDER2, width=4)
+        
+        items2 = [
+            ("SIX", C_6, (210,130,255)), 
+            ("FOUR", C_4, (120,195,255)), 
+            ("1-3", C_SINGLE, (80,240,120)), 
+            ("DOT", C_DOT, (65,70,130)), 
+            ("WICKET", C_WKT, (255,100,100))
+        ]
+        
+        lx3 = 180
+        badge_w = 140
+        for lbl2, lc2, lg2 in items2:
+            # Subtle glow behind badge
+            for gr4 in range(30, 0, -10):
+                ga3 = gr4/30 * 0.25
+                gc5 = tuple(max(0, min(255, int(lg2[i]*ga3))) for i in range(3))
+                if any(c > 0 for c in gc5):
+                    _draw_rounded_rect(draw, (lx3-gr4, legend_y+35-gr4//2, lx3+badge_w+gr4, legend_y+100+gr4//2), radius=15, fill=gc5)
+            
+            # Badge Fill & Text
+            _draw_rounded_rect(draw, (lx3, legend_y+35, lx3+badge_w, legend_y+100), radius=15, fill=lc2)
+            _draw_text_centered(draw, lbl2, lx3 + badge_w//2, legend_y+48, f_xs, (10,10,20))
+            lx3 += 380
+
+        # ══════════════════════════════════════════════════════
+        # CRICORA BRANDING FOOTER
+        # ══════════════════════════════════════════════════════
+        _draw_text_centered_glow(draw, f"⚡ Cricoverse  |  {match.group_name[:30]}  |  Strike Analytics",
+                                  W//2, H-60, f_xs, C_GRAY)
+
+        bio = BytesIO()
+        img.save(bio, 'PNG', optimize=False)
+        bio.seek(0)
+        return bio
+
+    except Exception as e:
+        logger.error(f"generate_strikemap_image error: {e}")
+        import traceback; logger.error(traceback.format_exc())
+        return None
 
 async def send_potm_message(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
     """
@@ -10130,7 +12207,7 @@ async def determine_super_over_winner(context: ContextTypes.DEFAULT_TYPE, group_
     # Update stats
     try:
         await update_player_stats_after_match(match, winner, loser)
-        save_match_to_history(match, winner.name, loser.name)
+        save_match_to_history(match, winner.name)
     except: pass
     
     await asyncio.sleep(3)
@@ -10269,79 +12346,137 @@ async def send_match_summary(context: ContextTypes.DEFAULT_TYPE, group_id: int, 
     )
 
 async def update_player_stats_after_match(match: Match, winner: Team, loser: Team):
-    """Update global player statistics after match - FIXED"""
+    """Update global player statistics after match — writes BOTH flat + team/solo dicts."""
     all_players = match.batting_first.players + match.bowling_first.players
-    
+
     for player in all_players:
         user_id = player.user_id
-        
-        # Initialize if needed
-        if user_id not in player_stats:
-            init_player_stats(user_id)
-        
-        stats = player_stats[user_id]
-        
-        # Update match count
-        stats["matches_played"] += 1
-        
-        # Check if winner (handle tied match)
-        if winner:
-            is_winner = (player in winner.players)
-            if is_winner:
-                stats["matches_won"] += 1
-        
-        # Update batting stats
+        init_player_stats(user_id)          # ensures all keys exist
+        stats    = player_stats[user_id]
+        is_winner = bool(winner and player in winner.players)
+
+        # ── flat legacy keys (kept for backward compat) ──
+        stats["matches_played"]     = stats.get("matches_played", 0) + 1
+        if winner and is_winner:
+            stats["matches_won"]    = stats.get("matches_won", 0) + 1
+
         if player.balls_faced > 0:
-            stats["total_runs"] += player.runs
-            stats["total_balls_faced"] += player.balls_faced
-            stats["dot_balls_faced"] += player.dot_balls_faced
-            stats["boundaries"] += getattr(player, 'boundaries', 0)
-            stats["sixes"] += getattr(player, 'sixes', 0)
-            
-            # Check for century/half-century
-            if player.runs >= 100:
-                stats["centuries"] += 1
-            elif player.runs >= 50:
-                stats["half_centuries"] += 1
-            
-            # Update highest score
-            if player.runs > stats["highest_score"]:
-                stats["highest_score"] = player.runs
-            
-            # Check for duck
-            if player.runs == 0 and player.is_out:
-                stats["ducks"] += 1
-            
-            # Update last 5 scores
-            stats["last_5_scores"].append(player.runs)
-            if len(stats["last_5_scores"]) > 5:
-                stats["last_5_scores"].pop(0)
-        
-        # Update bowling stats
+            stats["total_runs"]         = stats.get("total_runs", 0) + player.runs
+            stats["total_balls_faced"]  = stats.get("total_balls_faced", 0) + player.balls_faced
+            stats["dot_balls_faced"]    = stats.get("dot_balls_faced", 0) + getattr(player, 'dot_balls_faced', 0)
+            stats["boundaries"]         = stats.get("boundaries", 0) + getattr(player, 'boundaries', 0)
+            stats["sixes"]              = stats.get("sixes", 0) + getattr(player, 'sixes', 0)
+            if player.runs >= 100: stats["centuries"]       = stats.get("centuries", 0) + 1
+            elif player.runs >= 50: stats["half_centuries"] = stats.get("half_centuries", 0) + 1
+            if player.runs > stats.get("highest_score", 0): stats["highest_score"] = player.runs
+            if player.runs == 0 and player.is_out: stats["ducks"] = stats.get("ducks", 0) + 1
+            ls = stats.get("last_5_scores", []) + [player.runs]
+            stats["last_5_scores"] = ls[-5:]
+
         if player.balls_bowled > 0:
-            stats["total_wickets"] += player.wickets
-            stats["total_balls_bowled"] += player.balls_bowled
-            stats["total_runs_conceded"] += player.runs_conceded
-            stats["dot_balls_bowled"] += player.dot_balls_bowled
-            stats["total_no_balls"] += player.no_balls
-            stats["total_wides"] += player.wides
-            
-            # Update best bowling
-            if player.wickets > stats["best_bowling"]["wickets"]:
-                stats["best_bowling"]["wickets"] = player.wickets
-                stats["best_bowling"]["runs"] = player.runs_conceded
-            elif player.wickets == stats["best_bowling"]["wickets"] and player.runs_conceded < stats["best_bowling"]["runs"]:
-                stats["best_bowling"]["runs"] = player.runs_conceded
-            
-            # Update last 5 wickets
-            stats["last_5_wickets"].append(player.wickets)
-            if len(stats["last_5_wickets"]) > 5:
-                stats["last_5_wickets"].pop(0)
-        
-        # Update timeouts
-        stats["total_timeouts"] += player.batting_timeouts + player.bowling_timeouts
-    
-    # Save to disk
+            stats["total_wickets"]        = stats.get("total_wickets", 0) + player.wickets
+            stats["total_balls_bowled"]   = stats.get("total_balls_bowled", 0) + player.balls_bowled
+            stats["total_runs_conceded"]  = stats.get("total_runs_conceded", 0) + player.runs_conceded
+            stats["dot_balls_bowled"]     = stats.get("dot_balls_bowled", 0) + getattr(player, 'dot_balls_bowled', 0)
+            bb = stats.get("best_bowling")
+            if not isinstance(bb, dict): bb = {"wickets": 0, "runs": 999}
+            if player.wickets > bb["wickets"] or (player.wickets == bb["wickets"] and player.runs_conceded < bb.get("runs", 999)):
+                bb = {"wickets": player.wickets, "runs": player.runs_conceded}
+            stats["best_bowling"] = bb
+            lw = stats.get("last_5_wickets", []) + [player.wickets]
+            stats["last_5_wickets"] = lw[-5:]
+
+        # ══════════════════════════════════════════════
+        # ✅ TEAM DICT — this is what /mystats reads
+        # ══════════════════════════════════════════════
+        t = stats.setdefault("team", {})
+        t["matches"]        = t.get("matches", 0) + 1
+        t["matches_played"] = t.get("matches_played", 0) + 1
+        if is_winner:
+            t["wins"]       = t.get("wins", 0) + 1
+        t["runs"]           = t.get("runs", 0)  + player.runs
+        t["balls"]          = t.get("balls", 0) + player.balls_faced
+        t["wickets"]        = t.get("wickets", 0) + player.wickets
+        t["balls_bowled"]   = t.get("balls_bowled", 0) + player.balls_bowled
+        t["runs_conceded"]  = t.get("runs_conceded", 0) + player.runs_conceded
+        t["fours"]          = t.get("fours", 0) + getattr(player, 'boundaries', 0)
+        t["sixes"]          = t.get("sixes", 0) + getattr(player, 'sixes', 0)
+        t["dots"]           = t.get("dots", 0) + getattr(player, 'dot_balls_faced', 0)
+        if player.runs > t.get("highest", 0):      t["highest"] = player.runs
+        if player.runs >= 100:                     t["centuries"] = t.get("centuries", 0) + 1
+        elif player.runs >= 50:                    t["fifties"]   = t.get("fifties", 0) + 1
+        if player.runs == 0 and player.balls_faced > 0 and player.is_out:
+            t["ducks"] = t.get("ducks", 0) + 1
+        if not player.is_out and player.balls_faced > 0:
+            t["times_not_out"] = t.get("times_not_out", 0) + 1
+        # best bowling
+        cb_w = t.get("best_bowling_wickets", 0)
+        cb_r = t.get("best_bowling_runs", 999)
+        if player.balls_bowled > 0 and (player.wickets > cb_w or (player.wickets == cb_w and player.runs_conceded < cb_r)):
+            t["best_bowling_wickets"] = player.wickets
+            t["best_bowling_runs"]    = player.runs_conceded
+        stats["team"] = t
+
+        player_stats[user_id] = stats
+
+    # ── sync to DB ──
+    try:
+        conn_s = sqlite3.connect(DB_PATH)
+        cs = conn_s.cursor()
+        for player in all_players:
+            uid   = player.user_id
+            is_w  = 1 if (winner and player in winner.players) else 0
+            cs.execute("""
+                INSERT INTO user_stats
+                    (user_id, username, first_name,
+                     team_matches_played, team_matches_won,
+                     team_total_runs, team_total_balls_faced,
+                     team_total_wickets, team_total_balls_bowled,
+                     team_total_sixes, team_total_fours,
+                     team_highest_score, team_total_hundreds,
+                     team_total_fifties, team_total_ducks, team_total_dots)
+                VALUES (?,?,?, 1,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username              = excluded.username,
+                    first_name            = excluded.first_name,
+                    team_matches_played   = team_matches_played + 1,
+                    team_matches_won      = team_matches_won + ?,
+                    team_total_runs       = team_total_runs + ?,
+                    team_total_balls_faced= team_total_balls_faced + ?,
+                    team_total_wickets    = team_total_wickets + ?,
+                    team_total_balls_bowled=team_total_balls_bowled + ?,
+                    team_total_sixes      = team_total_sixes + ?,
+                    team_total_fours      = team_total_fours + ?,
+                    team_highest_score    = MAX(team_highest_score, ?),
+                    team_total_hundreds   = team_total_hundreds + ?,
+                    team_total_fifties    = team_total_fifties + ?,
+                    team_total_ducks      = team_total_ducks + ?,
+                    team_total_dots       = team_total_dots + ?
+            """, (
+                uid, player.username or "", player.first_name,
+                is_w, player.runs, player.balls_faced,
+                player.wickets, player.balls_bowled,
+                getattr(player,'sixes',0), getattr(player,'boundaries',0),
+                player.runs,
+                1 if player.runs >= 100 else 0,
+                1 if 50 <= player.runs < 100 else 0,
+                1 if (player.runs == 0 and player.balls_faced > 0 and player.is_out) else 0,
+                getattr(player,'dot_balls_faced', 0),
+                # ON CONFLICT update params
+                is_w, player.runs, player.balls_faced,
+                player.wickets, player.balls_bowled,
+                getattr(player,'sixes',0), getattr(player,'boundaries',0),
+                player.runs,
+                1 if player.runs >= 100 else 0,
+                1 if 50 <= player.runs < 100 else 0,
+                1 if (player.runs == 0 and player.balls_faced > 0 and player.is_out) else 0,
+                getattr(player,'dot_balls_faced', 0),
+            ))
+        conn_s.commit()
+        conn_s.close()
+    except Exception as db_e:
+        logger.error(f"DB sync error in update_player_stats: {db_e}")
+
     save_data()
 
 
@@ -10546,9 +12681,15 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name
-    
+
     if query is None:
-        # Initial command call
+        # ── Image cooldown check for groups ──
+        group_id = update.effective_chat.id
+        if update.effective_chat.type != "private":
+            remaining = check_image_cooldown(group_id)
+            if remaining is not None:
+                await send_cooldown_warning(update, remaining)
+                return
         keyboard = [
             [
                 InlineKeyboardButton("📊 Overall", callback_data=f"mystats_overall_{user_id}"),
@@ -10581,6 +12722,8 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML,
                     reply_markup=reply_markup
                 )
+                if update.effective_chat.type != "private":
+                    set_image_cooldown(update.effective_chat.id)
             else:
                 await update.message.reply_text(
                     caption,
@@ -10723,31 +12866,33 @@ async def mystats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 win_streak = hat_tricks = times_not_out = 0
         else:
             matches, wins, runs, hs, balls_faced, wickets, sixes, fours, hundreds, fifties, ducks, best_w, best_r, dots, balls_bowled, win_streak, hat_tricks, mom, fifer, times_not_out = db_row
-        
-        # ── Fallback: if DB zeros, read from in-memory player_stats ──
-        if matches == 0:
-            mem_team = player_stats.get(user_id, {}).get("team", {})
-            if mem_team.get("matches", 0) > 0:
-                matches = mem_team.get("matches", 0)
-                wins = mem_team.get("wins", 0)
-                runs = mem_team.get("runs", 0)
-                hs = mem_team.get("highest", 0)
-                balls_faced = mem_team.get("balls", 0)
-                wickets = mem_team.get("wickets", 0)
-                sixes = mem_team.get("sixes", 0)
-                fours = mem_team.get("fours", 0)
-                hundreds = mem_team.get("centuries", 0)
-                fifties = mem_team.get("fifties", 0)
-                ducks = mem_team.get("ducks", 0)
-                best_w = mem_team.get("best_bowling_wickets", 0)
-                best_r = mem_team.get("best_bowling_runs", 0)
-                dots = mem_team.get("dots", 0)
-                balls_bowled = mem_team.get("balls_bowled", 0)
-                win_streak = mem_team.get("win_streak", 0)
-                hat_tricks = mem_team.get("hat_tricks", 0)
-                mom = mem_team.get("mom", 0)
-                fifer = mem_team.get("five_wicket_hauls", 0)
-                times_not_out = mem_team.get("times_not_out", 0)
+
+        # ── PRIMARY: always prefer in-memory player_stats["team"] (most up-to-date) ──
+        mem_team = player_stats.get(user_id, {}).get("team", {})
+        if mem_team.get("matches", 0) > 0:
+            matches     = mem_team.get("matches", mem_team.get("matches_played", matches))
+            wins        = mem_team.get("wins", wins)
+            runs        = mem_team.get("runs", runs)
+            hs          = mem_team.get("highest", hs)
+            balls_faced = mem_team.get("balls", balls_faced)
+            wickets     = mem_team.get("wickets", wickets)
+            sixes       = mem_team.get("sixes", sixes)
+            fours       = mem_team.get("fours", fours)
+            hundreds    = mem_team.get("centuries", hundreds)
+            fifties     = mem_team.get("fifties", fifties)
+            ducks       = mem_team.get("ducks", ducks)
+            best_w      = mem_team.get("best_bowling_wickets", best_w)
+            best_r      = mem_team.get("best_bowling_runs", best_r)
+            dots        = mem_team.get("dots", dots)
+            balls_bowled= mem_team.get("balls_bowled", balls_bowled)
+            win_streak  = mem_team.get("win_streak", win_streak)
+            hat_tricks  = mem_team.get("hat_tricks", hat_tricks)
+            mom         = mem_team.get("mom", mom)
+            fifer       = mem_team.get("five_wicket_hauls", fifer)
+            times_not_out = mem_team.get("times_not_out", times_not_out)
+            runs_conceded = mem_team.get("runs_conceded", 0)
+        else:
+            runs_conceded = 0
 
         if matches == 0:
             text = (
@@ -10756,40 +12901,67 @@ async def mystats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Join a team match to get started. 🏏"
             )
         else:
-            avg = round(runs / max(matches - ducks, 1), 2)
-            sr = round((runs / max(balls_faced, 1)) * 100, 2)
+            # Batting metrics
+            inns_bat = matches - ducks
+            avg = round(runs / max(inns_bat, 1), 2)
+            sr  = round((runs / max(balls_faced, 1)) * 100, 2)
             win_rate = round((wins / matches) * 100, 1)
-            _form_s = player_stats.get(user_id, {}).get("last_5_scores", [])
+            losses = matches - wins
+            # Bowling metrics
+            eco = round((runs_conceded / max(balls_bowled, 1)) * 6, 2) if balls_bowled > 0 else "—"
+            bowl_avg = round(runs_conceded / max(wickets, 1), 2) if wickets > 0 else "—"
+            # overs text
+            overs_text = format_overs(balls_bowled)
+            # Recent form
+            _form_s  = player_stats.get(user_id, {}).get("last_5_scores", [])
             _form_bar = ""
             for _sc in _form_s[-5:]:
                 _form_bar += "🟩" if _sc >= 50 else "🟡" if _sc >= 20 else "🔴" if _sc == 0 else "🟠"
             _form_bar = _form_bar or "—"
 
-            text = f"👥 <b>{user_name}'s TEAM STATS</b>\n"
-            text += f"{SEP}\n"
-            text += f"🎮 <b>Matches:</b>  {matches}\n"
-            text += f"🏆 <b>Wins:</b>  {wins}  ┊  💔 <b>Losses:</b>  {matches-wins}  ┊  📈 <b>Win Rate:</b>  {win_rate}%\n"
-            text += f"🔥 <b>Win Streak:</b>  {win_streak}  ┊  🌟 <b>Man of Match:</b>  {mom}\n"
-            text += f"{SEP}\n"
-            text += f"🏏 <b>BATTING</b>\n"
-            text += f"├ 🏃 <b>Runs:</b>  {runs}\n"
-            text += f"├ 🎯 <b>Highest Score:</b>  {hs}\n"
-            text += f"├ ⚡ <b>Strike Rate:</b>  {sr}\n"
-            text += f"├ 📊 <b>Average:</b>  {avg}\n"
-            text += f"├ 🚀 <b>Sixes:</b>  {sixes}\n"
-            text += f"├ 🔥 <b>Fours:</b>  {fours}\n"
-            text += f"├ 💯 <b>Centuries:</b>  {hundreds}  ┊  5️⃣0️⃣ <b>Fifties:</b>  {fifties}\n"
-            text += f"└ 🦆 <b>Ducks:</b>  {ducks}  ┊  🏅 <b>Not Out:</b>  {times_not_out}\n"
-            text += f"{SEP}\n"
-            text += f"⚾ <b>BOWLING</b>\n"
-            text += f"├ 🎯 <b>Wickets:</b>  {wickets}\n"
-            text += f"├ 🎩 <b>Hat-tricks:</b>  {hat_tricks}\n"
-            text += f"├ 5⃣ <b>Five-Wicket Hauls:</b>  {fifer}\n"
-            text += f"└ 🏅 <b>Best Figure:</b>  {best_w}/{best_r}\n"
-            text += f"{SEP}\n"
-            text += f"📈 <b>RECENT FORM</b> (last 5)\n"
-            text += f"└ {_form_bar}\n"
-            text += f"🟩 50+  🟡 20+  🟠 <20  🔴 0"
+            # Captaincy stats
+            cap_matches = mem_team.get("cap_matches", mem_team.get("captain_matches", 0))
+            cap_wins    = mem_team.get("cap_wins", mem_team.get("captain_wins", 0))
+            cap_rate    = round((cap_wins / max(cap_matches, 1)) * 100, 1) if cap_matches > 0 else 0
+            best_bowl   = f"{best_w}/{best_r}" if best_w else "N/A"
+            bat_sr      = sr
+            bat_avg     = avg
+            highest     = hs
+
+            text = (
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👥 <b>TEAM CAREER PROFILE</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"├ 📛 <b>Player:</b> {user_name.upper()}\n"
+                f"└ 🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏆 <b>PLAYER RECORD</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"├ 🏟 <b>Matches:</b> {matches}\n"
+                f"├ 🏆 <b>Wins:</b> {wins}\n"
+                f"├ 🧢 <b>Captaincy:</b> {cap_wins}/{cap_matches} Wins ({cap_rate}%)\n"
+                f"└ 🌟 <b>Man of Match:</b> {mom}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏏 <b>BATTING ARSENAL</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"├ 🏃 <b>Runs:</b> {runs}\n"
+                f"├ 🏃 <b>Balls:</b> {balls_faced}\n"
+                f"├ 📊 <b>Average:</b> {bat_avg}\n"
+                f"├ ⚡ <b>Strike Rate:</b> {bat_sr}\n"
+                f"├ 🚀 <b>Highest:</b> {highest}\n"
+                f"├ 4️⃣ <b>Fours:</b> {fours} | 6️⃣ <b>Sixes:</b> {sixes}\n"
+                f"└ 💯 <b>100s:</b> {hundreds} | 50 <b>50s:</b> {fifties}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🥎 <b>BOWLING ATTACK</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"├ 🎯 <b>Wickets:</b> {wickets}\n"
+                f"├ 📉 <b>Economy:</b> {eco}\n"
+                f"├ 🔄 <b>Overs:</b> {overs_text}\n"
+                f"├ 📐 <b>Average:</b> {bowl_avg}\n"
+                f"├ 🔥 <b>Best Fig:</b> {best_bowl}\n"
+                f"├ 🎩 <b>Hat-tricks:</b> {hat_tricks}\n"
+                f"└ 🖐️ <b>5-Wkts:</b> {fifer}"
+            )
 
         keyboard = [[back_button]]
         try:
@@ -10811,31 +12983,50 @@ async def mystats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Challenge someone 1v1 to get started. ⚔️"
             )
         else:
-            solo = player_stats[user_id]["solo"]
+            solo    = player_stats[user_id]["solo"]
             matches = solo.get("matches", 0)
-            wins = solo.get("wins", 0)
-            runs = solo.get("runs", 0)
-            balls = solo.get("balls", 0)
-            hs = solo.get("high_score", 0)
-            sixes = solo.get("sixes", 0)
-            fours = solo.get("fours", 0)
-            
-            avg = round(runs / max(matches, 1), 2)
-            sr = round((runs / max(balls, 1)) * 100, 2)
-            win_rate = round((wins / max(matches, 1)) * 100, 1)
+            wins    = solo.get("wins", 0)
+            runs    = solo.get("runs", 0)
+            balls   = solo.get("balls", 0)
+            hs      = solo.get("high_score", solo.get("highest", 0))
+            sixes   = solo.get("sixes", 0)
+            fours   = solo.get("fours", 0)
+            ducks   = solo.get("ducks", 0)
+            centuries = solo.get("centuries", 0)
+            fifties   = solo.get("fifties", 0)
+            top3    = solo.get("top_3_finishes", 0)
 
-            text = f"⚔️ <b>{user_name}'s SOLO STATS</b>\n"
-            text += f"{SEP}\n"
-            text += f"🎮 <b>Matches:</b>  {matches}\n"
-            text += f"🏆 <b>Wins:</b>  {wins}  ┊  💔 <b>Losses:</b>  {matches-wins}  ┊  📈 <b>Win Rate:</b>  {win_rate}%\n"
-            text += f"{SEP}\n"
-            text += f"🏏 <b>BATTING</b>\n"
-            text += f"├ 🏃 <b>Runs:</b>  {runs}\n"
-            text += f"├ 🎯 <b>Highest Score:</b>  {hs}\n"
-            text += f"├ ⚡ <b>Strike Rate:</b>  {sr}\n"
-            text += f"├ 📊 <b>Average:</b>  {avg}\n"
-            text += f"├ 🚀 <b>Sixes:</b>  {sixes}\n"
-            text += f"└ 🔥 <b>Fours:</b>  {fours}"
+            win_rate = round((wins / max(matches, 1)) * 100, 1)
+            sr  = round((runs / max(balls, 1)) * 100, 2)
+            bat_sr = sr
+
+            target_id = user_id
+
+            text = (
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>SOLO CAREER PROFILE</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"├ 📛 <b>Player:</b> {user_name.upper()}\n"
+                f"└ 🆔 <b>ID:</b> <code>{target_id}</code>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏆 <b>PLAYER RECORD</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"├ 🏟 <b>Matches:</b> {matches}\n"
+                f"├ 👑 <b>Wins:</b> {wins}\n"
+                f"├ 📈 <b>Win Rate:</b> {win_rate}%\n"
+                f"└ 🥉 <b>Top 3 Finishes:</b> {top3}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏏 <b>BATTING SKILLS</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"├ 🏃 <b>Total Runs:</b> {runs}\n"
+                f"├ ⚾ <b>Balls Faced:</b> {balls}\n"
+                f"├ ⚡ <b>Strike Rate:</b> {bat_sr}\n"
+                f"├ 🚀 <b>High Score:</b> {hs}\n"
+                f"├ 4️⃣ <b>Fours:</b> {fours} | 6️⃣ <b>Sixes:</b> {sixes}\n"
+                f"├ 💯 <b>100s:</b> {centuries} | 50 <b>50s:</b> {fifties}\n"
+                f"└ 🦆 <b>Ducks:</b> {ducks}\n\n"
+                f"<i>⚠️ Solo mode doesn't count wickets.</i>"
+            )
 
         keyword = [[back_button]]
         try:
@@ -12061,20 +14252,38 @@ async def pauseauction_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if auction.bid_timer_task:
         auction.bid_timer_task.cancel()
         auction.bid_timer_task = None
-        await update.message.reply_text(
-            "⏸ <b>AUCTION PAUSED!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "⏳ Timer stopped\n"
-            "▶️ Use <code>/resumeauction</code> to continue\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML
-        )
-    else:
-        await update.message.reply_text(
-            "⚠️ <b>TIMER NOT RUNNING!</b>\n\n"
-            "The auction timer is not currently active.",
-            parse_mode=ParseMode.HTML
-        )
+    
+    # Build sold players list
+    sold_count = len(auction.sold_players)
+    remaining_count = len(auction.player_pool)
+    total_auctioned = sold_count + len(auction.unsold_players)
+    
+    sold_summary = ""
+    if auction.sold_players:
+        sold_summary = "\n<b>🔨 Recently Sold:</b>\n"
+        for sp in auction.sold_players[-5:]:
+            p_id = sp.get('player_id', '')
+            p_name = sp.get('player_name', 'Unknown')
+            p_tag = f"<a href='tg://user?id={p_id}'>{p_name}</a>"
+            sold_summary += f"  • {p_tag} → {sp.get('team','?')} (💰{sp.get('price',0)})\n"
+        if sold_count > 5:
+            sold_summary += f"  <i>... and {sold_count - 5} more</i>\n"
+
+    remaining_list = ""
+    if auction.player_pool:
+        remaining_list = "\n<b>⏳ Remaining Players:</b>\n"
+        for rp in auction.player_pool[:5]:
+            remaining_list += f"  • {html.escape(rp['player_name'])}\n"
+        if remaining_count > 5:
+            remaining_list += f"  <i>... and {remaining_count - 5} more</i>\n"
+
+    msg = (
+        f"⏸ <b>AUCTION PAUSED</b>\n\n"
+        f"✅ Sold: <b>{sold_count}</b>  |  ❌ Unsold: <b>{len(auction.unsold_players)}</b>  |  ⏳ Remaining: <b>{remaining_count}</b>"
+        f"{sold_summary}{remaining_list}\n"
+        f"▶️ Use <code>/resumeauction</code> to continue"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def resumeauction_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """▶ Resume auction timer (Auctioneer/Host Only)"""
@@ -12296,6 +14505,22 @@ async def bid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
+        # ✅ NEW: Same team cannot override their own bid unless another team has bid
+        if auction.current_highest_bidder and auction.current_highest_bidder == team_name:
+            # Check if the current highest bid is same as base price (no other team bid yet after us)
+            # Allow override only if another team placed a bid after ours
+            # We track this via auction.last_bid_teams list
+            last_bid_teams = getattr(auction, 'last_bid_teams', [])
+            # If the last 2 bids are both from the same team, block
+            if len(last_bid_teams) >= 1 and last_bid_teams[-1] == team_name:
+                await update.message.reply_text(
+                    f"🚫 <b>CANNOT OVERBID YOURSELF!</b>\n\n"
+                    f"💼 <b>{team_name}</b> is already the highest bidder at <b>{auction.current_highest_bid}</b>.\n"
+                    f"Wait for another team to bid before raising your own bid!",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+        
         if amount > team.purse_remaining:
             await update.message.reply_text(
                 f"💰 <b>INSUFFICIENT FUNDS!</b>\n\n"
@@ -12308,6 +14533,12 @@ async def bid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Update Bid
         auction.current_highest_bid = amount
         auction.current_highest_bidder = team_name
+        # Track bid history for same-team override prevention
+        if not hasattr(auction, 'last_bid_teams'):
+            auction.last_bid_teams = []
+        auction.last_bid_teams.append(team_name)
+        if len(auction.last_bid_teams) > 10:
+            auction.last_bid_teams = auction.last_bid_teams[-10:]
         
         # Reset Timer: Cancel old, set new end time, start new task
         if auction.bid_timer_task:
@@ -12325,16 +14556,12 @@ async def bid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bid_gif = GIFS.get("new_bid")  # Add this GIF to your GIFS dict
         
         msg = (
-            f"🔥〔 <b>NEW BID!</b> 〕🔥\n\n"
-            f"👤 {p_tag}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"  💰 {amount} coins  \n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🚩 Team: <b>{team_name}</b>\n"
-            f"👤 Bidder: {bidder_tag}\n"
-            f"⏱ Timer reset: <b>30 seconds</b>\n\n"
-            f"💼 Purse after bid: <b>{team.purse_remaining - amount}</b>\n\n"
-            f"⌨️ Outbid with <code>/bid [higher amount]</code>!"
+            f"🔥 <b>NEW BID</b> — {team_name}\n\n"
+            f"👤 {p_tag}\n"
+            f"💰 <b>{amount} coins</b>  ·  Bidder: {bidder_tag}\n"
+            f"💼 Purse after bid: <b>{team.purse_remaining - amount}</b>\n"
+            f"⏱ Timer reset: 30s\n\n"
+            f"⌨️ <code>/bid [higher amount]</code> to outbid!"
         )
         
         try:
@@ -12394,15 +14621,11 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, auction: A
                 player_tag = f"<a href='tg://user?id={auction.current_player_id}'>{auction.current_player_name}</a>"
                 
                 msg = (
-                    f"🔨〔 <b>SOLD!</b> 〕🔨\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"  👤 {player_tag}  \n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"🚩 Team: <b>{auction.current_highest_bidder}</b>\n"
-                    f"💰 Final Price: <b>{auction.current_highest_bid} coins</b>\n\n"
-                    f"💼 Purse Remaining: <b>{team.purse_remaining}</b>\n"
-                    f"👥 Squad Size: <b>{len(team.players)} players</b>\n\n"
-                    f"🎯 <i>Next player coming up...</i>"
+                    f"🔨 <b>SOLD!</b> — {auction.current_highest_bidder}\n\n"
+                    f"👤 {player_tag}\n"
+                    f"💰 Final Price: <b>{auction.current_highest_bid} coins</b>\n"
+                    f"💼 Purse Remaining: <b>{team.purse_remaining}</b>  ·  Squad: <b>{len(team.players)}</b>\n\n"
+                    f"🎯 Next player coming up..."
                 )
                 
                 try:
@@ -12425,14 +14648,11 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, auction: A
                 player_tag = f"<a href='tg://user?id={auction.current_player_id}'>{auction.current_player_name}</a>"
                 
                 msg = (
-                    f"😔〔 <b>UNSOLD!</b> 〕😔\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"  👤 {player_tag}  \n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"💸 Base Price: <b>{auction.current_base_price} coins</b>\n"
-                    f"📦 No bids placed — player goes unsold.\n\n"
-                    f"📊 Total Unsold: <b>{len(auction.unsold_players)}</b>\n\n"
-                    f"🎯 <i>Next player coming up...</i>"
+                    f"😔 <b>UNSOLD</b>\n\n"
+                    f"👤 {player_tag}\n"
+                    f"💸 Base Price: <b>{auction.current_base_price} coins</b>  ·  No bids placed.\n"
+                    f"📦 Total Unsold: <b>{len(auction.unsold_players)}</b>\n\n"
+                    f"🎯 Next player coming up..."
                 )
                 
                 try:
@@ -14381,6 +16601,16 @@ async def check_and_trigger_super_over(update, context, group_id, match):
     
     return True  # Super over triggered
 
+
+async def _auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: float):
+    """Auto-delete a message after `delay` seconds."""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
 async def handle_group_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Unified Handle Group Input
@@ -14446,16 +16676,25 @@ async def handle_group_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             striker = batting_team.players[batting_team.current_batsman_idx]
             bowler = bowling_team.players[bowling_team.current_bowler_idx]
             
-            # Sub-Case A: Bowler sent number in Group (Backup for DM)
+            # Sub-Case A: Bowler tries to send number in Group → Block, redirect to DM
             if user_id == bowler.user_id:
                 if match.current_ball_data.get("bowler_number") is None:
-                    match.current_ball_data["bowler_number"] = number
-                    
-                    await context.bot.send_message(chat_id, f"⚾ <b>{bowler.first_name}</b> has bowled!", parse_mode=ParseMode.HTML)
-                    
-                    # Cancel timeout & Request Batsman
-                    if match.ball_timeout_task: match.ball_timeout_task.cancel()
-                    await request_batsman_number(context, chat_id, match)
+                    # ❌ Only DM allowed for bowler
+                    try:
+                        w = await context.bot.send_message(
+                            chat_id,
+                            f"🚫 <b>{html.escape(bowler.first_name)}</b>, please send your number in my DM! 📩\n"
+                            f"<i>Group number not accepted.</i>",
+                            parse_mode=ParseMode.HTML
+                        )
+                        asyncio.create_task(_auto_delete(context, chat_id, w.message_id, 5))
+                    except Exception:
+                        pass
+                    # Try to delete the bowler's message
+                    try:
+                        await update.message.delete()
+                    except Exception:
+                        pass
                     processed = True
 
             # Sub-Case B: Striker sent number (The Shot)
@@ -15009,252 +17248,118 @@ def determine_strike_zone(runs: int) -> str:
     return random.choice(possible_zones)
 
 async def strikemap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """🏏 Fast strike map - text based showing last 4 overs"""
+    """🗺️ 4K Wagon-wheel strike map — visual ball-by-ball distribution"""
     group_id = update.effective_chat.id
+    # ── Strikemap 2-minute cooldown (groups only) ──
+    if update.effective_chat.type != "private":
+        remaining = check_strikemap_cooldown(group_id)
+        if remaining is not None:
+            secs = math.ceil(remaining)
+            await update.message.reply_text(
+                f"⏳ <b>Strike Map Cooldown</b>\n\nWait <b>{secs}s</b> before generating another strike map.",
+                parse_mode=ParseMode.HTML
+            )
+            return
     match = active_matches.get(group_id)
-    
+
     if not match or not match.ball_by_ball_log:
         await update.message.reply_text("🏏 No ball-by-ball data yet!")
         return
-    
-    text = "╔═══════════════════════╗\n"
-    text += "      🎯 <b>STRIKE MAP</b>\n"
-    text += "╚═══════════════════════╝\n\n"
-    
-    # Get last 24 balls (4 overs)
-    recent = match.ball_by_ball_log[-24:] if len(match.ball_by_ball_log) >= 24 else match.ball_by_ball_log
-    
-    if not recent:
-        await update.message.reply_text("🏏 No balls bowled yet!")
-        return
-    
-    text += "<b>Last 4 Overs</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    over_num = 1
-    ball_in_over = 0
-    over_runs = 0
-    over_text = ""
-    
-    for i, ball_data in enumerate(recent):
-        runs = ball_data.get('runs', 0)
-        is_wicket = ball_data.get('wicket', False)
-        is_wide = ball_data.get('wide', False)
-        is_noball = ball_data.get('noball', False)
-        
-        # Determine emoji
-        if is_wicket:
-            emoji = "🔴"
-            ball_symbol = "W"
-        elif is_wide:
-            emoji = "🟡"
-            ball_symbol = "Wd"
-            over_runs += 1
-        elif is_noball:
-            emoji = "🟠"
-            ball_symbol = "Nb"
-            over_runs += 1
-        elif runs == 6:
-            emoji = "🟣"
-            ball_symbol = "6"
-            over_runs += runs
-        elif runs == 4:
-            emoji = "🔵"
-            ball_symbol = "4"
-            over_runs += runs
-        elif runs == 0:
-            emoji = "⚫"
-            ball_symbol = "•"
-        else:
-            emoji = "🟢"
-            ball_symbol = str(runs)
-            over_runs += runs
-        
-        over_text += f"{emoji} "
-        
-        # Don't count wides and noballs as legal balls
-        if not is_wide and not is_noball:
-            ball_in_over += 1
-            
-            # Complete over after 6 legal balls
-            if ball_in_over == 6:
-                text += f"<b>Over {over_num}:</b> {over_text}({over_runs} runs)\n"
-                over_num += 1
-                ball_in_over = 0
-                over_runs = 0
-                over_text = ""
-    
-    # Show incomplete over
-    if ball_in_over > 0:
-        text += f"<b>Over {over_num}:</b> {over_text}({over_runs} runs*)\n"
-    
-    # Summary stats
-    text += "\n━━━━━━━━━━━━━━━━━━━━━━\n"
-    
-    total_runs = sum(b.get('runs', 0) for b in recent)
-    wickets = sum(1 for b in recent if b.get('wicket', False))
-    boundaries = sum(1 for b in recent if b.get('runs', 0) in [4, 6])
-    dots = sum(1 for b in recent if b.get('runs', 0) == 0 and not b.get('wide', False) and not b.get('noball', False))
-    
-    text += f"📊 <b>Summary ({len(recent)} balls)</b>\n"
-    text += f"   Runs: <b>{total_runs}</b> | Wickets: <b>{wickets}</b>\n"
-    text += f"   Boundaries: <b>{boundaries}</b> | Dots: <b>{dots}</b>\n\n"
-    
-    # Legend
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "<i>🟣 Six | 🔵 Four | 🟢 Runs\n"
-    text += "⚫ Dot | 🔴 Wicket\n"
-    text += "🟡 Wide | 🟠 No Ball</i>\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━"
-    
+
+    wait_msg = await update.message.reply_text("🗺️ Generating strike map…")
     try:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-    except:
-        await update.message.reply_text(text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
+        bio = generate_strikemap_image(match)
+        if bio:
+            bat_team  = match.current_batting_team  or match.batting_first or match.team_x
+            bowl_team = match.current_bowling_team or match.team_y
+            total = len(match.ball_by_ball_log)
+            sixes  = sum(1 for b in match.ball_by_ball_log if b.get("runs",0)==6)
+            fours  = sum(1 for b in match.ball_by_ball_log if b.get("runs",0)==4)
+            wkts   = sum(1 for b in match.ball_by_ball_log if b.get("wicket") or b.get("is_wicket"))
+            await context.bot.send_photo(
+                chat_id=group_id,
+                photo=bio,
+                caption=(
+                    f"🗺️ <b>STRIKE MAP</b>  —  {bat_team.name}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 {bat_team.score}/{bat_team.wickets}  ({format_overs(bowl_team.balls)} ov)\n"
+                    f"🚀 Sixes: {sixes}  🔥 Fours: {fours}  ❌ Wkts: {wkts}  ⚫ Balls: {total}"
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            if update.effective_chat.type != "private":
+                set_image_cooldown(group_id)
+                set_strikemap_cooldown(group_id)
+            try: await wait_msg.delete()
+            except: pass
+            return
+    except Exception as e:
+        logger.error(f"strikemap image error: {e}")
+
+    try: await wait_msg.delete()
+    except: pass
+    await update.message.reply_text("🏏 Strike map data unavailable.")
 
 async def momentum_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """🏏 Quick momentum meter showing recent performance"""
+    """⚡ 4K Momentum dashboard — speedometer power bars + win% gauge + history chart"""
     group_id = update.effective_chat.id
+    # ── Momentum 2-minute cooldown ──
+    if update.effective_chat.type != "private":
+        remaining = check_momentum_cooldown(group_id)
+        if remaining is not None:
+            secs = math.ceil(remaining)
+            await update.message.reply_text(
+                f"⏳ <b>Momentum Cooldown</b>\n\nWait <b>{secs}s</b> before generating another momentum dashboard.",
+                parse_mode=ParseMode.HTML
+            )
+            return
     match = active_matches.get(group_id)
-    
+
     if not match:
         await update.message.reply_text("🏏 No active match!")
         return
-    
+
     if not match.ball_by_ball_log or len(match.ball_by_ball_log) < 6:
         await update.message.reply_text("🏏 Not enough data yet! Play at least 1 over.")
         return
-    
-    text = "⚡ <b>MOMENTUM METER</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    # Get last 12 balls (2 overs)
-    recent = match.ball_by_ball_log[-12:] if len(match.ball_by_ball_log) >= 12 else match.ball_by_ball_log
-    
-    # Track runs and boundaries for each team
-    team_x_runs = 0
-    team_y_runs = 0
-    team_x_boundaries = 0
-    team_y_boundaries = 0
-    team_x_sixes = 0
-    team_y_sixes = 0
-    team_x_wickets = 0
-    team_y_wickets = 0
-    team_x_dots = 0
-    team_y_dots = 0
-    
-    for ball in recent:
-        batting_team = ball.get('batting_team', '')
-        runs = ball.get('runs', 0)
-        is_wicket = ball.get('wicket', False)
-        is_wide = ball.get('wide', False)
-        is_noball = ball.get('noball', False)
-        
-        if batting_team == match.team_x.name or batting_team == 'X':
-            team_x_runs += runs
-            if runs == 6:
-                team_x_sixes += 1
-                team_x_boundaries += 1
-            elif runs == 4:
-                team_x_boundaries += 1
-            elif runs == 0 and not is_wide and not is_noball:
-                team_x_dots += 1
-            if is_wicket:
-                team_y_wickets += 1  # Bowling team gets credit
-        elif batting_team == match.team_y.name or batting_team == 'Y':
-            team_y_runs += runs
-            if runs == 6:
-                team_y_sixes += 1
-                team_y_boundaries += 1
-            elif runs == 4:
-                team_y_boundaries += 1
-            elif runs == 0 and not is_wide and not is_noball:
-                team_y_dots += 1
-            if is_wicket:
-                team_x_wickets += 1  # Bowling team gets credit
-    
-    text += f"<b>Last {len(recent)} Balls</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    # Team X Stats
-    text += f"🔵 <b>{match.team_x.name}</b>\n"
-    text += f"   📈 Runs: <b>{team_x_runs}</b>\n"
-    text += f"   🎯 Boundaries: {team_x_boundaries} "
-    if team_x_sixes > 0:
-        text += f"(4s: {team_x_boundaries - team_x_sixes}, 6s: {team_x_sixes})\n"
-    else:
-        text += f"(4s: {team_x_boundaries})\n"
-    text += f"   ⚫ Dots: {team_x_dots} | 🔴 Wickets: {team_x_wickets}\n"
-    
-    # Emoji momentum bar Team X
-    _mx = team_x_runs + team_x_boundaries*3 - team_x_wickets*15 - team_x_dots
-    _px = max(0, min(10, 5 + round(_mx/5)))
-    _bx = ""
-    for _i in range(10):
-        if _i < _px:
-            _bx += ("🟥" if _px>=8 else "🟧" if _px>=5 else "🟩")
-        else:
-            _bx += "⬜"
-    text += f"   {_bx}\n\n"
-    # Team Y Stats
-    text += f"🔴 <b>{match.team_y.name}</b>\n"
-    text += f"   📈 Runs: <b>{team_y_runs}</b>\n"
-    text += f"   🎯 Boundaries: {team_y_boundaries} "
-    if team_y_sixes > 0:
-        text += f"(4s: {team_y_boundaries - team_y_sixes}, 6s: {team_y_sixes})\n"
-    else:
-        text += f"(4s: {team_y_boundaries})\n"
-    text += f"   ⚫ Dots: {team_y_dots} | 🔴 Wickets: {team_y_wickets}\n"
-    
-    # Emoji momentum bar Team Y
-    _my = team_y_runs + team_y_boundaries*3 - team_y_wickets*15 - team_y_dots
-    _py = max(0, min(10, 5 + round(_my/5)))
-    _by = ""
-    for _i in range(10):
-        if _i < _py:
-            _by += ("🟥" if _py>=8 else "🟧" if _py>=5 else "🟩")
-        else:
-            _by += "⬜"
-    text += f"   {_by}\n\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    # Calculate momentum score
-    team_x_momentum = team_x_runs + (team_x_boundaries * 3) + (team_x_sixes * 2) - (team_x_wickets * 15) - (team_x_dots * 1)
-    team_y_momentum = team_y_runs + (team_y_boundaries * 3) + (team_y_sixes * 2) - (team_y_wickets * 15) - (team_y_dots * 1)
-    
-    # Determine momentum winner
-    if team_x_momentum > team_y_momentum + 10:
-        text += f"⚡ <b>{match.team_x.name}</b> dominating! 🔥🔥🔥\n"
-        text += f"   <i>Momentum Score: {team_x_momentum} vs {team_y_momentum}</i>"
-    elif team_y_momentum > team_x_momentum + 10:
-        text += f"⚡ <b>{match.team_y.name}</b> dominating! 🔥🔥🔥\n"
-        text += f"   <i>Momentum Score: {team_y_momentum} vs {team_x_momentum}</i>"
-    elif team_x_momentum > team_y_momentum:
-        text += f"📊 <b>{match.team_x.name}</b> have slight edge 💪\n"
-        text += f"   <i>Momentum Score: {team_x_momentum} vs {team_y_momentum}</i>"
-    elif team_y_momentum > team_x_momentum:
-        text += f"📊 <b>{match.team_y.name}</b> have slight edge 💪\n"
-        text += f"   <i>Momentum Score: {team_y_momentum} vs {team_x_momentum}</i>"
-    else:
-        text += f"⚖️ <b>Perfectly balanced!</b> ⚔️\n"
-        text += f"   <i>Momentum Score: {team_x_momentum} vs {team_y_momentum}</i>"
-    
-    # Last 6 balls
-    _l6 = match.ball_by_ball_log[-6:] if len(match.ball_by_ball_log) >= 6 else match.ball_by_ball_log
-    _l6t = ""
-    for _b in _l6:
-        _r = _b.get("runs",0); _w = _b.get("is_wicket",False) or _b.get("wicket",False)
-        if _w: _l6t += "❌"
-        elif _b.get("wide"): _l6t += "〰️"
-        elif _r == 6: _l6t += "🚀"
-        elif _r == 4: _l6t += "🔥"
-        elif _r == 0: _l6t += "⚫"
-        else: _l6t += f"{_r}️⃣"
-    if _l6t: text += f"\n🎬 <b>Last balls:</b> {_l6t}"
-    text += "\n━━━━━━━━━━━━━━━━━━━━━━"
-    text += "\n⬜ Low  🟩 OK  🟧 Hot  🟥 On Fire!"
+
+    wait_msg = await update.message.reply_text("⚡ Generating momentum dashboard…")
     try:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-    except:
-        await update.message.reply_text(text.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>",""))
+        bio = generate_momentum_image(match)
+        if bio:
+            bat_team  = match.current_batting_team  or match.team_x
+            bowl_team = match.current_bowling_team or match.team_y
+            await context.bot.send_photo(
+                chat_id=group_id,
+                photo=bio,
+                caption=(
+                    f"⚡ <b>MOMENTUM DASHBOARD</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔵 <b>{match.team_x.name}</b>  vs  🔴 <b>{match.team_y.name}</b>\n"
+                    f"📊 <b>{format_overs(bat_team.balls)}</b> overs  •  "
+                    f"{bat_team.score}/{bat_team.wickets}"
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            if update.effective_chat.type != "private":
+                set_image_cooldown(group_id)
+                set_momentum_cooldown(group_id)
+            try: await wait_msg.delete()
+            except: pass
+            return
+    except Exception as e:
+        logger.error(f"momentum image error: {e}")
+
+    try: await wait_msg.delete()
+    except: pass
+    # Fallback text
+    await update.message.reply_text(
+        "⚡ <b>MOMENTUM</b>\n"
+        f"🔵 {match.team_x.name}: {match.team_x.score}/{match.team_x.wickets}\n"
+        f"🔴 {match.team_y.name}: {match.team_y.score}/{match.team_y.wickets}\n"
+        f"📊 {format_overs(match.current_batting_team.balls if match.current_batting_team else match.team_x.balls)} overs",
+        parse_mode=ParseMode.HTML
+    )
 
 
 async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -15379,7 +17484,7 @@ async def gcsettings_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     # Get current settings
-    drs_on = get_gc_setting(group_id, "drs_enabled", True)
+    drs_on = get_gc_setting(group_id, "drs_enabled", False)
     wide_on = get_gc_setting(group_id, "wide_enabled", True)
     commentary = get_gc_setting(group_id, "commentary_style", "english")
     lobby_time = get_gc_setting(group_id, "lobby_time", 120)
@@ -15449,10 +17554,10 @@ async def gcsettings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Ensure settings exist
     if group_id not in gc_settings:
-        gc_settings[group_id] = {"drs_enabled": True, "commentary_style": "english", "wide_enabled": True, "lobby_time": 120}
+        gc_settings[group_id] = {"drs_enabled": False, "commentary_style": "english", "wide_enabled": True, "lobby_time": 120}
     
     if data == f"gcs_drs_{group_id}":
-        gc_settings[group_id]["drs_enabled"] = not gc_settings[group_id].get("drs_enabled", True)
+        gc_settings[group_id]["drs_enabled"] = not gc_settings[group_id].get("drs_enabled", False)
     elif data == f"gcs_wide_{group_id}":
         gc_settings[group_id]["wide_enabled"] = not gc_settings[group_id].get("wide_enabled", True)
     elif data.startswith(f"gcs_comm_"):
@@ -15468,7 +17573,7 @@ async def gcsettings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     save_gc_setting(group_id)
     
     # Rebuild message
-    drs_on = gc_settings[group_id].get("drs_enabled", True)
+    drs_on = gc_settings[group_id].get("drs_enabled", False)
     wide_on = gc_settings[group_id].get("wide_enabled", True)
     commentary = gc_settings[group_id].get("commentary_style", "english")
     lobby_time = gc_settings[group_id].get("lobby_time", 120)
@@ -15682,23 +17787,23 @@ async def endauction_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         auction.bid_timer_task.cancel()
         auction.bid_timer_task = None
     
-    auction.phase = AuctionPhase.AUCTION_ENDED
-    
-    summary_lines = ["🏁 <b>AUCTION ENDED</b>\n"]
-    
-    for team_name, team in auction.teams.items():
-        summary_lines.append(f"<b>{html.escape(team_name)}</b>")
-        summary_lines.append(f"Players: {len(team.players)}")
-        summary_lines.append(f"Spent: ₹{team.total_spent}")
-        summary_lines.append(f"Remaining: ₹{team.purse_remaining}\n")
-    
+    sold_count = len(auction.sold_players)
+    remaining_count = len(auction.player_pool)
+    unsold_count = len(auction.unsold_players)
+
+    confirm_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, End Auction", callback_data=f"confirm_endauction_{group_id}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel_endauction")
+    ]])
+
     await update.message.reply_text(
-        "\n".join(summary_lines),
-        parse_mode=ParseMode.HTML
+        f"🏁 <b>END AUCTION?</b>\n\n"
+        f"✅ Sold: <b>{sold_count}</b>  |  ❌ Unsold: <b>{unsold_count}</b>  |  ⏳ Remaining: <b>{remaining_count}</b>\n\n"
+        f"Are you sure you want to officially end the auction?\n"
+        f"<i>The auction can still continue if you cancel.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=confirm_kb
     )
-    
-    if group_id in active_auctions:
-        del active_auctions[group_id]
 
 async def end_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -16864,45 +18969,75 @@ async def scorecard_refresh_callback(update: Update, context: ContextTypes.DEFAU
         await query.answer("❌ No active match!", show_alert=True)
         return
 
-    def _inn_block(bat_team, label, bowl_team):
-        s  = f"🏏 <b>{html.escape(bat_team.name)}</b> — {label}\n"
-        s += f"📊 {bat_team.score}/{bat_team.wickets} ({bat_team.overs} ov)  +{bat_team.extras} extras\n"
-        s += "━━━━━━━━━━━━━━━━━━\n🏏 <b>BATTING</b>\n"
-        for pl in bat_team.players:
-            if pl.balls_faced > 0 or pl.is_out:
-                _sr = round((pl.runs / max(pl.balls_faced, 1)) * 100, 1)
-                _st = "❌" if pl.is_out else "🟢"
-                _bdry = f"  4️⃣{pl.boundaries}" if pl.boundaries else ""
-                _sx   = f"  🚀{pl.sixes}" if pl.sixes else ""
-                s += f"  {_st} <b>{html.escape(pl.first_name)}</b> {pl.runs}({pl.balls_faced}) SR:{_sr}{_bdry}{_sx}\n"
-        s += "⚾ <b>BOWLING</b>\n"
-        for pl in bowl_team.players:
-            if pl.balls_bowled > 0:
-                _ov   = format_overs(pl.balls_bowled)
-                _econ = round(pl.runs_conceded / max(pl.balls_bowled / 6, 0.1), 2)
-                s += f"  ⚡ <b>{html.escape(pl.first_name)}</b> {pl.wickets}W/{pl.runs_conceded}R ({_ov}ov) Eco:{_econ}\n"
+    def _bat_line(pl, team):
+        _sr = round((pl.runs / max(pl.balls_faced, 1)) * 100, 1)
+        _st = "❌" if pl.is_out else "🟢"
+        cap = " 👑" if pl.user_id == team.captain_id else ""
+        bdry = f"  4s:<b>{pl.boundaries}</b>" if pl.boundaries > 0 else ""
+        sxs  = f"  6s:<b>{pl.sixes}</b>" if pl.sixes > 0 else ""
+        return (
+            f"  {_st} <b>{html.escape(pl.first_name[:14])}{cap}</b>\n"
+            f"    ├ {pl.runs}({pl.balls_faced})  SR: {_sr}{bdry}{sxs}\n"
+        )
+
+    def _bowl_line(pl):
+        if pl.balls_bowled == 0: return ""
+        _ov   = format_overs(pl.balls_bowled)
+        _econ = round(pl.runs_conceded / max(pl.balls_bowled / 6, 0.1), 2)
+        return f"  ⚡ <b>{html.escape(pl.first_name[:14])}</b>  <code>{pl.wickets}/{pl.runs_conceded}</code>  {_ov}ov  Eco: {_econ}\n"
+
+    def _inn_block(bat_team, bowl_team, inn_label, inn_num):
+        rr = round(bat_team.score / (bat_team.balls / 6), 2) if bat_team.balls > 0 else 0
+        extras = bat_team.extras if hasattr(bat_team, 'extras') else 0
+        s = (
+            f"╔══════════════════════════╗\n"
+            f"║  🏏 {inn_num} INNINGS — {html.escape(bat_team.name)}\n"
+            f"╚══════════════════════════╝\n"
+            f"📊 <b>{bat_team.score}/{bat_team.wickets}</b>  ({format_overs(bat_team.balls)} ov)  "
+            f"RR: <b>{rr}</b>  Extras: {extras}\n"
+            f"─────────────────────────────\n"
+            f"🏏 <b>BATTING</b>\n"
+        )
+        batters = [p for p in bat_team.players if p.balls_faced > 0 or p.is_out]
+        for pl in batters:
+            s += _bat_line(pl, bat_team)
+        if not batters:
+            s += "  <i>Not started yet</i>\n"
+        s += "─────────────────────────────\n⚾ <b>BOWLING</b>\n"
+        bowlers = [p for p in bowl_team.players if p.balls_bowled > 0]
+        for pl in bowlers:
+            s += _bowl_line(pl)
+        if not bowlers:
+            s += "  <i>No bowlers yet</i>\n"
         return s
 
     first  = match.batting_first or match.team_x
     second = match.team_y if first == match.team_x else match.team_x
 
-    text  = "📊 <b>LIVE SCORECARD</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += _inn_block(first, "1st Innings", second)
+    now = datetime.now().strftime("%d %b %Y  %H:%M")
+    text = (
+        f"📋 <b>LIVE SCORECARD</b>  ●  {match.total_overs} Overs\n"
+        f"🏟️ <i>CricoVerse Hand Cricket</i>  ·  {now}\n"
+        f"══════════════════════════════\n\n"
+    )
+    text += _inn_block(first, second, "1ST", "1st")
     if match.innings >= 2:
-        text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-        text += _inn_block(second, "2nd Innings", first)
+        text += "\n"
         if match.target > 0:
             _nd = match.target - second.score
             _bl = (match.total_overs * 6) - second.balls
             _rr = round(_nd / (_bl / 6), 2) if _bl > 0 else 0
-            text += f"🎯 Need <b>{_nd}</b> off <b>{_bl}</b> balls  (RRR: {_rr})\n"
-    # Partnership
+            text += (
+                f"🎯 <b>TARGET: {match.target}</b>  ·  "
+                f"Need <b>{_nd}</b> off <b>{_bl}b</b>  ·  RRR: <b>{_rr}</b>\n\n"
+            )
+        text += _inn_block(second, first, "2nd Innings", "2nd")
     if match.current_partnership_runs > 0:
-        text += f"🤝 <b>Partnership:</b> {match.current_partnership_runs}({match.current_partnership_balls})\n"
+        text += f"\n🤝 <b>Partnership:</b> {match.current_partnership_runs}({match.current_partnership_balls})\n"
+    text += "\n<i>🔄 Tap Refresh for latest scores</i>"
 
     refresh_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Refresh", callback_data=f"scorecard_refresh_{group_id}")
+        InlineKeyboardButton("🔄 Refresh Scorecard", callback_data=f"scorecard_refresh_{group_id}")
     ]])
     try:
         await query.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=refresh_kb)
@@ -16930,6 +19065,13 @@ async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🏆 Show global leaderboard with tabs"""
+    group_id = update.effective_chat.id
+    # ── Image cooldown check ──
+    if update.effective_chat.type != "private":
+        remaining = check_image_cooldown(group_id)
+        if remaining is not None:
+            await send_cooldown_warning(update, remaining)
+            return
     text  = "🏆 <b>CRICOVERSE GLOBAL LEADERBOARD</b>\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
     text += "🌍 Stats across <b>all groups</b> combined\n"
